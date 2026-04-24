@@ -8,3 +8,7 @@ static/art/
 static/audio_*
 plugins/*/
 !plugins/__init__.py
+docker-compose.yml
+requirements.txt
+docker-compose.yml
+plugins/tabview

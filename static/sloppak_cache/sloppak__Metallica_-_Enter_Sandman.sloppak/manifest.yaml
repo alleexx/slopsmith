@@ -1,0 +1,59 @@
+title: Enter Sandman
+artist: Metallica
+album: The Black Album
+year: 1991
+duration: 334.702
+cover: cover.jpg
+stems:
+- id: guitar
+  file: stems/guitar.ogg
+  default: 'on'
+- id: bass
+  file: stems/bass.ogg
+  default: 'on'
+- id: drums
+  file: stems/drums.ogg
+  default: 'on'
+- id: vocals
+  file: stems/vocals.ogg
+  default: 'on'
+- id: piano
+  file: stems/piano.ogg
+  default: 'on'
+- id: other
+  file: stems/other.ogg
+  default: 'on'
+arrangements:
+- id: lead
+  name: Lead
+  file: arrangements/lead.json
+  tuning:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  capo: 0
+- id: rhythm
+  name: Rhythm
+  file: arrangements/rhythm.json
+  tuning:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  capo: 0
+- id: bass
+  name: Bass
+  file: arrangements/bass.json
+  tuning:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  capo: 0

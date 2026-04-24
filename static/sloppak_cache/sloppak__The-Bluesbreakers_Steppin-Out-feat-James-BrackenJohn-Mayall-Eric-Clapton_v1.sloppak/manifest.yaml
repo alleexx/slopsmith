@@ -1,0 +1,37 @@
+title: Steppin' Out (feat. James Bracken/John Mayall/Eric Clapton)
+artist: The Bluesbreakers
+album: Blues Breakers
+year: 1966
+duration: 156.975
+cover: cover.jpg
+stems:
+- id: guitar
+  file: stems/guitar.ogg
+  default: 'on'
+- id: bass
+  file: stems/bass.ogg
+  default: 'on'
+- id: drums
+  file: stems/drums.ogg
+  default: 'on'
+- id: vocals
+  file: stems/vocals.ogg
+  default: 'on'
+- id: piano
+  file: stems/piano.ogg
+  default: 'on'
+- id: other
+  file: stems/other.ogg
+  default: 'on'
+arrangements:
+- id: lead
+  name: Lead
+  file: arrangements/lead.json
+  tuning:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  capo: 0

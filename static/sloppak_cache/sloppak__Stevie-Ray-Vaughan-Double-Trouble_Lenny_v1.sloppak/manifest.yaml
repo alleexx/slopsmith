@@ -1,0 +1,48 @@
+title: Lenny
+artist: Stevie Ray Vaughan & Double Trouble
+album: Texas Flood
+year: 1983
+duration: 308.372
+cover: cover.jpg
+stems:
+- id: guitar
+  file: stems/guitar.ogg
+  default: 'on'
+- id: bass
+  file: stems/bass.ogg
+  default: 'on'
+- id: drums
+  file: stems/drums.ogg
+  default: 'on'
+- id: vocals
+  file: stems/vocals.ogg
+  default: 'on'
+- id: piano
+  file: stems/piano.ogg
+  default: 'on'
+- id: other
+  file: stems/other.ogg
+  default: 'on'
+arrangements:
+- id: lead
+  name: Lead
+  file: arrangements/lead.json
+  tuning:
+  - -1
+  - -1
+  - -1
+  - -1
+  - -1
+  - -1
+  capo: 0
+- id: bass
+  name: Bass
+  file: arrangements/bass.json
+  tuning:
+  - -1
+  - -1
+  - -1
+  - -1
+  - -1
+  - -1
+  capo: 0

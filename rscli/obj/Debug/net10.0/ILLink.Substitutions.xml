@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<linker>
+  <assembly fullname="RsCli">
+    <resource name="FSharpSignatureData.RsCli" action="remove"></resource>
+    <resource name="FSharpSignatureCompressedData.RsCli" action="remove"></resource>
+    <resource name="FSharpSignatureDataB.RsCli" action="remove"></resource>
+    <resource name="FSharpSignatureCompressedDataB.RsCli" action="remove"></resource>
+    <resource name="FSharpOptimizationData.RsCli" action="remove"></resource>
+    <resource name="FSharpOptimizationCompressedData.RsCli" action="remove"></resource>
+    <resource name="FSharpOptimizationDataB.RsCli" action="remove"></resource>
+    <resource name="FSharpOptimizationCompressedDataB.RsCli" action="remove"></resource>
+    <resource name="FSharpOptimizationInfo.RsCli" action="remove"></resource>
+    <resource name="FSharpSignatureInfo.RsCli" action="remove"></resource>
+  </assembly>
+</linker>

@@ -13,8 +13,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 from psarc import unpack_psarc, read_psarc_entries
-from song import load_song, parse_arrangement
+from song import load_song, phrase_to_wire
 from audio import find_wem_files, convert_wem
+from tunings import tuning_name
 import sloppak as sloppak_mod
 
 import concurrent.futures
@@ -36,6 +37,7 @@ CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(Path.home() / ".local" / "sha
 # Writable cache directories (use CONFIG_DIR, not STATIC_DIR which may be read-only)
 ART_CACHE_DIR = CONFIG_DIR / "art_cache"
 AUDIO_CACHE_DIR = CONFIG_DIR / "audio_cache"
+SLOPPAK_CACHE_DIR = CONFIG_DIR / "sloppak_cache"
 
 
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
@@ -327,44 +329,6 @@ def _get_dlc_dir() -> Path | None:
 
 # ── Background metadata scan ──────────────────────────────────────────────────
 
-def _tuning_name(offsets: list[int]) -> str:
-    # Standard tunings (all strings same offset)
-    standard = {
-        0: "E Standard", -1: "Eb Standard", -2: "D Standard",
-        -3: "C# Standard", -4: "C Standard", -5: "B Standard",
-        -6: "Bb Standard", -7: "A Standard",
-        1: "F Standard", 2: "F# Standard",
-    }
-    if len(offsets) >= 6 and all(o == offsets[0] for o in offsets):
-        name = standard.get(offsets[0])
-        if name:
-            return name
-
-    # Drop tunings (low string 2 semitones below the rest)
-    # Named after the low string's note: e.g. offsets[-2,0,0,0,0,0] = Drop D (low E dropped to D)
-    if len(offsets) >= 6 and offsets[0] == offsets[1] - 2 and all(o == offsets[1] for o in offsets[1:]):
-        note_names = ["E", "F", "F#", "G", "Ab", "A", "Bb", "B", "C", "C#", "D", "Eb"]
-        low_note = note_names[offsets[0] % 12]
-        return f"Drop {low_note}"
-
-    # Common named tunings
-    named = {
-        (-2, 0, 0, 0, 0, 0): "Drop D",
-        (-4, -2, -2, -2, -2, -2): "Drop C",
-        (-2, -2, 0, 0, 0, 0): "Double Drop D",
-        (0, 0, 0, -1, 0, 0): "Open G",
-        (-2, -2, 0, 0, -2, -2): "Open D",
-        (-2, 0, 0, 0, -2, 0): "DADGAD",
-        (0, 2, 2, 1, 0, 0): "Open E",
-        (-2, 0, 0, 2, 3, 2): "Open D (alt)",
-    }
-    key = tuple(offsets[:6])
-    if key in named:
-        return named[key]
-
-    return " ".join(str(o) for o in offsets)
-
-
 def _extract_meta_fast(psarc_path: Path) -> dict:
     """Extract metadata from a PSARC using in-memory reading (no disk I/O)."""
     files = read_psarc_entries(str(psarc_path), ["*.json", "*.xml", "*vocals*.sng"])
@@ -404,7 +368,7 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
                     tun = attrs.get("Tuning")
                     if tun and isinstance(tun, dict):
                         offsets = [tun.get(f"string{i}", 0) for i in range(6)]
-                        tun_name = _tuning_name(offsets)
+                        tun_name = tuning_name(offsets)
                         is_guitar = arr_name in ("Lead", "Rhythm", "Combo")
                         if tuning == "E Standard" or (is_guitar and not _tuning_from_guitar):
                             tuning = tun_name
@@ -447,7 +411,7 @@ def _extract_meta_sloppak(path: Path) -> dict:
     """Extract metadata for a sloppak (file or directory)."""
     meta = sloppak_mod.extract_meta(path)
     offsets = meta.pop("tuning_offsets", None) or [0] * 6
-    meta["tuning"] = _tuning_name(offsets)
+    meta["tuning"] = tuning_name(offsets)
     meta["format"] = "sloppak"
     return meta
 
@@ -469,7 +433,7 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         song = load_song(tmp)
         tuning = "E Standard"
         if song.arrangements and song.arrangements[0].tuning:
-            tuning = _tuning_name(song.arrangements[0].tuning)
+            tuning = tuning_name(song.arrangements[0].tuning)
         arrangements = [
             {"index": i, "name": a.name,
              "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
@@ -493,25 +457,46 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-_scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+_SCAN_STATUS_INIT = {"running": False, "stage": "idle", "total": 0, "done": 0, "current": "", "error": None}
+_scan_status = dict(_SCAN_STATUS_INIT)
 
 
 def _background_scan():
     """Scan all PSARCs and cache metadata on startup. Uses thread pool for parallelism."""
     global _scan_status
+    _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "listing"}
+
     dlc = _get_dlc_dir()
     if not dlc:
-        _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "idle", "error": "DLC folder not configured"}
+        print("Scan: no DLC folder configured", flush=True)
         return
 
-    # Skip RS1 compatibility mega-PSARCs (multi-song, not individually playable)
-    psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
-              if f.is_file()
-              and "rs1compatibility" not in f.name.lower()]
-    # Sloppaks: match both file (zip) and directory form by suffix.
-    sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
-                if sloppak_mod.is_sloppak(f)]
+    # Listing can fail on macOS without Full Disk Access, or on Docker if the
+    # path isn't shared. Report the failure explicitly rather than silently
+    # appearing to scan nothing.
+    try:
+        # Skip RS1 compatibility mega-PSARCs (multi-song, not individually playable)
+        psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
+                  if f.is_file()
+                  and "rs1compatibility" not in f.name.lower()]
+        # Sloppaks: match both file (zip) and directory form by suffix.
+        sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
+                    if sloppak_mod.is_sloppak(f)]
+    except PermissionError as e:
+        msg = (f"Permission denied reading {dlc}. "
+               "On macOS: grant Full Disk Access to the app in System Settings → Privacy & Security. "
+               "With Docker: share this path in Docker Desktop → Settings → Resources → File Sharing.")
+        print(f"Scan failed: {msg} ({e})", flush=True)
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": msg}
+        return
+    except OSError as e:
+        print(f"Scan failed listing {dlc}: {e}", flush=True)
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": f"Unable to list {dlc}: {e}"}
+        return
+
     all_songs = psarcs + sloppaks
+    print(f"Scan: listed {len(psarcs)} PSARCs and {len(sloppaks)} sloppaks in {dlc}", flush=True)
 
     def _rel(f: Path) -> str:
         # Store the path relative to the DLC root so sub-folders (e.g.
@@ -528,7 +513,7 @@ def _background_scan():
     # Clean up stale DB entries
     stale = meta_db.delete_missing(current_files)
     if stale:
-        print(f"Removed {stale} stale DB entries")
+        print(f"Removed {stale} stale DB entries", flush=True)
 
     # Figure out which need scanning
     to_scan = []
@@ -538,14 +523,18 @@ def _background_scan():
             to_scan.append((f, stat))
 
     if not to_scan:
-        _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
+        print(f"Scan: nothing new to scan ({len(all_songs)} songs, all cached)", flush=True)
         return
 
-    _scan_status = {"running": True, "total": len(to_scan), "done": 0, "current": ""}
-    print(f"Library: {len(psarcs)} PSARCs + {len(sloppaks)} sloppaks, {len(all_songs) - len(to_scan)} cached, {len(to_scan)} to scan")
+    _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "scanning", "total": len(to_scan)}
+    print(f"Library: {len(psarcs)} PSARCs + {len(sloppaks)} sloppaks, {len(all_songs) - len(to_scan)} cached, {len(to_scan)} to scan", flush=True)
 
     def _scan_one(item):
         f, stat = item
+        # Per-file log so users running the server / desktop can see live
+        # activity and distinguish a stuck scan from a slow one.
+        print(f"  scanning {f.name}", flush=True)
         meta = _extract_meta_for_file(f)
         return _rel(f), stat.st_mtime, stat.st_size, meta
 
@@ -557,27 +546,36 @@ def _background_scan():
                 name, mtime, size, meta = future.result()
                 meta_db.put(name, mtime, size, meta)
             except Exception as e:
-                print(f"  Failed: {fname}: {e}")
+                print(f"  Failed: {fname}: {e}", flush=True)
             _scan_status["done"] += 1
             _scan_status["current"] = fname
 
-    print(f"Scan complete: {len(to_scan)} songs cached")
-    _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+    print(f"Scan complete: {len(to_scan)} songs cached", flush=True)
+    _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
 
 
-# ── Load plugins at import time (before app starts) ─────────────────────────
+# ── Register plugin API endpoints (lightweight, before app starts) ───────────
 from plugins import load_plugins, register_plugin_api
 register_plugin_api(app)
-load_plugins(app, {
-    "config_dir": CONFIG_DIR,
-    "get_dlc_dir": _get_dlc_dir,
-    "extract_meta": _extract_meta_for_file,
-    "meta_db": meta_db,
-    "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
-})
+
+# Plugin loading deferred to startup event (see below) to avoid blocking
+# server startup when many plugins are installed.
 
 
 @app.on_event("startup")
+def startup_events():
+    # Load plugins in background after server starts
+    load_plugins(app, {
+        "config_dir": CONFIG_DIR,
+        "get_dlc_dir": _get_dlc_dir,
+        "extract_meta": _extract_meta_for_file,
+        "meta_db": meta_db,
+        "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
+    })
+    # Start background metadata scan
+    startup_scan()
+
+
 def startup_scan():
     """Start background metadata scan and periodic rescan on server start."""
     thread = threading.Thread(target=_background_scan, daemon=True)
@@ -595,6 +593,21 @@ def _periodic_rescan():
         if not _scan_status["running"]:
             _background_scan()
         time.sleep(300)
+
+
+@app.get("/api/version")
+def get_version():
+    env_version = os.environ.get("APP_VERSION", "").strip()
+    if env_version:
+        return {"version": env_version}
+    version_file = Path(__file__).parent / "VERSION"
+    version = "unknown"
+    if version_file.exists():
+        try:
+            version = version_file.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            pass
+    return {"version": version}
 
 
 @app.get("/api/scan-status")
@@ -708,40 +721,103 @@ def delete_loop(loop_id: int):
 
 # ── Settings API ──────────────────────────────────────────────────────────────
 
+def _default_settings():
+    """Fallback settings returned when config.json is missing or
+    unreadable. Also used to seed a fresh cfg on first-run POSTs so a
+    single-key write (e.g. the difficulty slider) can't silently wipe
+    defaults that subsequent GETs would have exposed."""
+    return {"dlc_dir": str(DLC_DIR) if DLC_DIR.is_dir() else ""}
+
+
+def _load_config(config_file):
+    """Read and parse config.json. Returns the parsed dict, or None if
+    the file is missing, unreadable, invalid JSON, or parses to a
+    non-dict (e.g. the file contains `[]` or `42`). Callers treat None
+    as "fall back to defaults". Shared between GET and POST so both
+    handle bad files the same way."""
+    if not config_file.exists():
+        return None
+    try:
+        parsed = json.loads(config_file.read_text())
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 @app.get("/api/settings")
 def get_settings():
-    config_file = CONFIG_DIR / "config.json"
-    if config_file.exists():
-        try:
-            return json.loads(config_file.read_text())
-        except Exception:
-            pass
-    return {"dlc_dir": str(DLC_DIR) if DLC_DIR.is_dir() else ""}
+    cfg = _load_config(CONFIG_DIR / "config.json")
+    return cfg if cfg is not None else _default_settings()
 
 
 @app.post("/api/settings")
 def save_settings(data: dict):
+    # Partial-update: merge only keys present in the request body so
+    # single-key POSTs (like the difficulty slider's oninput) don't
+    # clobber unrelated settings on disk.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_file = CONFIG_DIR / "config.json"
-    cfg = {}
-    if config_file.exists():
-        try:
-            cfg = json.loads(config_file.read_text())
-        except Exception:
-            pass
+    # Seed defaults when config.json is missing, unreadable, or parses
+    # to a non-dict (e.g. `[]`, `42`). Without the non-dict guard, the
+    # next `cfg["..."] = ...` assignment would raise TypeError and 500
+    # the public endpoint. Seeding also ensures single-key POSTs (the
+    # difficulty slider's fire-and-forget write) don't produce a config
+    # file missing the dlc_dir fallback GET would have surfaced.
+    cfg = _load_config(config_file)
+    if cfg is None:
+        cfg = _default_settings()
 
     messages = []
-    dlc_path = data.get("dlc_dir", "")
-    if dlc_path:
-        if Path(dlc_path).is_dir():
-            cfg["dlc_dir"] = dlc_path
-            count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
-            messages.append(f"DLC folder: {count} .psarc files found")
+    if "dlc_dir" in data:
+        dlc_path = data["dlc_dir"]
+        # null / missing is no-op (preserve on-disk value). Only an
+        # explicit empty string means "clear". Non-string values are
+        # rejected so Path(...) can't be surprised by non-str JSON.
+        if dlc_path is None:
+            pass
+        elif not isinstance(dlc_path, str):
+            return {"error": "dlc_dir must be a string path or empty"}
+        elif dlc_path == "":
+            cfg["dlc_dir"] = ""
         else:
-            return {"error": f"DLC directory not found: {dlc_path}"}
+            if Path(dlc_path).is_dir():
+                cfg["dlc_dir"] = dlc_path
+                count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
+                messages.append(f"DLC folder: {count} .psarc files found")
+            else:
+                return {"error": f"DLC directory not found: {dlc_path}"}
 
-    cfg["default_arrangement"] = data.get("default_arrangement", "")
-    cfg["demucs_server_url"] = data.get("demucs_server_url", "")
+    # Both of these are consumed downstream as strings (e.g.
+    # demucs_server_url.rstrip('/') in lib/sloppak_convert.py), so
+    # reject non-string shapes here. Matches the dlc_dir pattern above:
+    # null is no-op, empty string clears, non-string is a structured
+    # error that preserves the on-disk value.
+    for key in ("default_arrangement", "demucs_server_url"):
+        if key in data:
+            raw = data[key]
+            if raw is None:
+                pass
+            elif not isinstance(raw, str):
+                return {"error": f"{key} must be a string or empty"}
+            else:
+                cfg[key] = raw
+    if "master_difficulty" in data:
+        # Coerce defensively — public endpoint, so `null`, `""`, or a
+        # non-numeric string shouldn't 500 the request. float() accepts
+        # both integer and float-shaped strings; anything else returns
+        # a structured error like the dlc_dir branch above.
+        raw = data["master_difficulty"]
+        # Reject bool explicitly: Python makes bool a subclass of int, so
+        # True/False would otherwise coerce to 1/0 and persist as a valid
+        # difficulty. Caller almost certainly means "bad input".
+        if isinstance(raw, bool):
+            return {"error": "master_difficulty must be a number between 0 and 100"}
+        try:
+            cfg["master_difficulty"] = max(0, min(100, int(float(raw))))
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError covers int(float("inf")) / int(float("1e309"))
+            # which Python raises distinctly from ValueError.
+            return {"error": "master_difficulty must be a number between 0 and 100"}
 
     config_file.write_text(json.dumps(cfg, indent=2))
     return {"message": ". ".join(messages) if messages else "Settings saved"}
@@ -1053,9 +1129,6 @@ def _get_or_extract(filename, psarc_path):
     return tmp, song, True  # True = freshly extracted
 
 
-SLOPPAK_CACHE_DIR = STATIC_DIR / "sloppak_cache"
-
-
 @app.get("/api/sloppak/{filename:path}/file/{rel_path:path}")
 def serve_sloppak_file(filename: str, rel_path: str):
     """Serve a file from inside a sloppak (stems, cover, etc.)."""
@@ -1177,6 +1250,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
 
         # Convert audio with unique filename (check cache first)
         audio_url = None
+        audio_error: str | None = None  # Surfaced in song_info when audio_url is None
         stems_payload: list[dict] = []
         audio_id = Path(filename).stem.replace(" ", "_")
 
@@ -1191,6 +1265,8 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 stems_payload.append({"id": s["id"], "url": url, "default": s["default"]})
             if stems_payload:
                 audio_url = stems_payload[0]["url"]
+            else:
+                audio_error = "This sloppak has no playable stems."
         else:
             AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             # Check if audio already cached (writable cache dir or legacy static dir)
@@ -1206,7 +1282,9 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         if not audio_url and not is_slop:
             await websocket.send_json({"type": "loading", "stage": "Converting audio..."})
             wem_files = find_wem_files(tmp)
-            if wem_files:
+            if not wem_files:
+                audio_error = "No WEM audio files were found inside this PSARC."
+            else:
                 try:
                     audio_path = convert_wem(wem_files[0], os.path.join(tmp, "audio"))
                     ext = Path(audio_path).suffix
@@ -1217,6 +1295,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                     print(f"Audio conversion failed: {e}")
                     import traceback
                     traceback.print_exc()
+                    audio_error = f"Audio conversion failed: {e}"
 
             # Clean up old audio cache files (keep max 100)
             try:
@@ -1241,6 +1320,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "arrangement_index": best,
             "arrangements": arr_list,
             "audio_url": audio_url,
+            "audio_error": audio_error,
             "tuning": arr.tuning,
             "capo": arr.capo,
             "format": "sloppak" if is_slop else "psarc",
@@ -1432,6 +1512,27 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 "data": chords[i:i+500],
                 "total": len(chords),
             })
+
+        # Per-phrase difficulty data for the master-difficulty slider
+        # (slopsmith#48). Only sent when the source chart had multiple
+        # `<level>` tiers — single-level charts (GP converter, older
+        # sloppaks without phrase data) produce arr.phrases=None, and the
+        # frontend treats the missing message as "slider disabled".
+        # Consumers that don't know about this message type ignore it.
+        #
+        # Chunked at phrase granularity (20 phrases per frame) because
+        # each phrase nests per-level note/chord lists — a single frame
+        # could otherwise exceed proxy/WS size limits on large songs.
+        # Chunk boundary is per-phrase (not per-level) so the frontend
+        # reassembles whole phrase ladders.
+        if arr.phrases:
+            total = len(arr.phrases)
+            for i in range(0, total, 20):
+                await websocket.send_json({
+                    "type": "phrases",
+                    "data": [phrase_to_wire(p) for p in arr.phrases[i:i + 20]],
+                    "total": total,
+                })
 
         await websocket.send_json({"type": "ready"})
 

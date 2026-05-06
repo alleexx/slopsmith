@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Slopsmith</title>
+    <!-- Placeholder favicon — emoji SVG data URI. Swap for a real logo later. See #55. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%8E%B8%3C/text%3E%3C/svg%3E">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -29,9 +31,12 @@
     <!-- Navigation -->
     <nav id="navbar" class="fixed top-0 w-full z-50 transition-all duration-300">
         <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-            <a href="#" onclick="showScreen('home');return false" class="text-xl font-bold bg-gradient-to-r from-accent-light to-purple-400 bg-clip-text text-transparent">
-                Slopsmith
-            </a>
+            <div class="flex items-end gap-1.5">
+                <a href="#" onclick="showScreen('home');return false" class="text-xl font-bold bg-gradient-to-r from-accent-light to-purple-400 bg-clip-text text-transparent">
+                    Slopsmith
+                </a>
+                <span id="app-version" class="text-xs text-gray-600 mb-0.5"></span>
+            </div>
             <div class="hidden md:flex items-center gap-8">
                 <a href="#library-section" onclick="showScreen('home')" class="text-sm text-gray-400 hover:text-white transition">Library</a>
                 <a href="#" onclick="showScreen('favorites');return false" class="text-sm text-gray-400 hover:text-white transition">Favorites</a>
@@ -163,6 +168,7 @@
                     <div class="flex gap-3">
                         <input type="text" id="dlc-path" placeholder="/path/to/Rocksmith2014/dlc"
                             class="flex-1 bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                        <button onclick="pickDlcFolder()" id="btn-pick-dlc" class="hidden bg-dark-600 hover:bg-dark-500 px-4 py-2.5 rounded-xl text-sm text-gray-300 transition whitespace-nowrap">📂 Browse</button>
                         <button onclick="saveSettings()" class="bg-accent hover:bg-accent-light px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition">Save</button>
                     </div>
                 </div>
@@ -197,6 +203,14 @@
                         <span id="rescan-status" class="text-xs text-gray-500"></span>
                     </div>
                     <p class="text-xs text-gray-600 mt-1">Rescan checks for new songs. Full Rescan clears the cache and re-imports everything.</p>
+                </div>
+                <div>
+                    <label class="text-sm font-medium text-gray-400 mb-2 block">Plugin Updates</label>
+                    <div class="flex items-center gap-3 mb-2">
+                        <button onclick="checkPluginUpdates()" id="btn-check-updates" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Check for Updates</button>
+                        <span id="updates-status" class="text-xs text-gray-500"></span>
+                    </div>
+                    <div id="plugin-updates-list" class="space-y-2"></div>
                 </div>
                 <!-- Plugin settings injected here -->
                 <div id="plugin-settings" class="space-y-6"></div>
@@ -282,6 +296,9 @@
             <select id="arr-select" onchange="changeArrangement(this.value)" class="bg-dark-600 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 outline-none max-w-[130px]"></select>
             <input type="range" id="speed-slider" min="25" max="150" value="100" step="5" oninput="setSpeed(this.value/100)" class="w-20 accent-accent">
             <span id="speed-label" class="text-xs text-gray-500 w-10">1.0x</span>
+            <span id="mastery-slider-label" class="text-xs text-gray-500 ml-1">Difficulty</span>
+            <input type="range" id="mastery-slider" min="0" max="100" value="100" step="5" oninput="setMastery(this.value)" class="w-20 accent-accent" title="Master difficulty — low = simpler chart, high = full" aria-labelledby="mastery-slider-label">
+            <span id="mastery-label" class="text-xs text-gray-500 w-10">100%</span>
             <input type="range" id="volume" min="0" max="100" value="80" oninput="setVolume(this.value)" class="w-20 accent-accent">
             <span id="vol-label" class="text-xs text-gray-500 w-8">80%</span>
             <button onclick="highway.toggleLyrics()" id="btn-lyrics" class="px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition">Lyrics ✓</button>
@@ -289,6 +306,12 @@
                 <option value="1">HD</option>
                 <option value="0.75">Medium</option>
                 <option value="0.5">Low</option>
+            </select>
+            <span id="viz-picker-label" class="text-xs text-gray-500 ml-1 sr-only">Visualization</span>
+            <select id="viz-picker" onchange="setViz(this.value)" class="bg-dark-600 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 outline-none" aria-labelledby="viz-picker-label" title="Visualization">
+                <option value="auto">Auto (match arrangement)</option>
+                <option value="default">Highway</option>
+                <!-- Additional entries populated on load from /api/plugins (slopsmith#36) -->
             </select>
             <span class="text-gray-700 mx-1">|</span>
             <button onclick="setLoopStart()" id="btn-loop-a" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" title="Set loop start at current time">A</button>

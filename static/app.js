@@ -5,8 +5,16 @@ function showScreen(id) {
     if (id === 'home') loadLibrary();
     if (id === 'favorites') loadFavorites();
     if (id === 'settings') loadSettings();
-    if (id !== 'player') { highway.stop(); }
+    if (id !== 'player') {
+        highway.stop();
+        const audio = document.getElementById('audio');
+        audio.pause();
+        audio.src = '';
+        isPlaying = false;
+        document.getElementById('btn-play').textContent = '▶ Play';
+    }
     window.scrollTo(0, 0);
+    if (window.slopsmith) window.slopsmith.emit('screen:changed', { id });
 }
 
 // ── Library ──────────────────────────────────────────────────────────────
@@ -16,6 +24,12 @@ const PAGE_SIZE = 24;
 let _treeLetter = '';
 let _treeStats = null;
 let _debounceTimer = null;
+let _loadingMore = false;
+let _hasMore = true;
+let _gridObserver = null;
+// Bumped on filter/sort/view changes so in-flight page fetches can detect
+// they've been superseded and skip rendering stale results.
+let _libEpoch = 0;
 
 function setLibView(view) {
     libView = view;
@@ -25,8 +39,8 @@ function setLibView(view) {
     document.querySelectorAll('.lib-tree-ctrl').forEach(el => el.classList.toggle('hidden', view !== 'tree'));
     document.getElementById('view-grid-btn').className = `px-3 py-2.5 text-sm transition ${view === 'grid' ? 'text-accent-light' : 'text-gray-600 hover:text-gray-400'}`;
     document.getElementById('view-tree-btn').className = `px-3 py-2.5 text-sm transition ${view === 'tree' ? 'text-accent-light' : 'text-gray-600 hover:text-gray-400'}`;
-    const pag = document.getElementById('lib-pagination');
-    if (pag && view !== 'grid') pag.innerHTML = '';
+    if (view !== 'grid') stopInfiniteScroll();
+    _libEpoch++;
     loadLibrary();
 }
 
@@ -41,6 +55,7 @@ async function loadLibrary(page) {
 function filterLibrary() {
     clearTimeout(_debounceTimer);
     _debounceTimer = setTimeout(() => {
+        _libEpoch++;
         currentPage = 0;
         _treeLetter = '';
         loadLibrary(0);
@@ -48,56 +63,59 @@ function filterLibrary() {
 }
 
 function sortLibrary() {
+    _libEpoch++;
     currentPage = 0;
     loadLibrary(0);
 }
 
-// ── Grid View (server-side) ─────────────────────────────────────────────
+// ── Grid View (server-side pagination, infinite scroll) ────────────────
 
 async function loadGridPage(page = 0) {
+    const myEpoch = _libEpoch;
     const q = document.getElementById('lib-filter').value.trim();
     const sort = document.getElementById('lib-sort').value;
     const format = (document.getElementById('lib-format') || {}).value || '';
-    currentPage = page;
     const params = new URLSearchParams({ q, page, size: PAGE_SIZE, sort });
     if (format) params.set('format', format);
     const resp = await fetch(`/api/library?${params}`);
     const data = await resp.json();
-    const totalPages = Math.ceil((data.total || 0) / PAGE_SIZE);
+    if (myEpoch !== _libEpoch) return; // filter/sort/view changed mid-fetch
 
-    document.getElementById('lib-count').textContent =
-        `${data.total || 0} songs · Page ${currentPage + 1} of ${Math.max(1, totalPages)}`;
+    currentPage = page;
+    const total = data.total || 0;
+    document.getElementById('lib-count').textContent = `${total} songs`;
 
-    renderGridCards(data.songs || []);
-    renderPagination(totalPages);
+    renderGridCards(data.songs || [], 'lib-grid', page === 0 ? 'replace' : 'append');
+
+    _hasMore = (page + 1) * PAGE_SIZE < total;
+    setupInfiniteScroll();
 }
 
-function renderPagination(totalPages) {
-    let pag = document.getElementById('lib-pagination');
-    if (!pag) {
-        pag = document.createElement('div');
-        pag.id = 'lib-pagination';
-        pag.className = 'flex items-center justify-center gap-2 py-6';
-        document.getElementById('lib-grid').after(pag);
+function setupInfiniteScroll() {
+    let sentinel = document.getElementById('lib-grid-sentinel');
+    if (!sentinel) {
+        sentinel = document.createElement('div');
+        sentinel.id = 'lib-grid-sentinel';
+        sentinel.style.height = '1px';
+        document.getElementById('lib-grid').after(sentinel);
     }
-    if (totalPages <= 1) { pag.innerHTML = ''; return; }
-    let html = '';
-    html += `<button onclick="goPage(0)" class="px-3 py-1.5 rounded-lg text-xs ${currentPage === 0 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage === 0 ? 'disabled' : ''}>« First</button>`;
-    html += `<button onclick="goPage(${currentPage - 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage === 0 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage === 0 ? 'disabled' : ''}>‹ Prev</button>`;
-    const start = Math.max(0, currentPage - 2);
-    const end = Math.min(totalPages, start + 5);
-    for (let i = start; i < end; i++) {
-        const active = i === currentPage;
-        html += `<button onclick="goPage(${i})" class="px-3 py-1.5 rounded-lg text-xs ${active ? 'bg-accent text-white' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}">${i + 1}</button>`;
-    }
-    html += `<button onclick="goPage(${currentPage + 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage >= totalPages - 1 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Next ›</button>`;
-    html += `<button onclick="goPage(${totalPages - 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage >= totalPages - 1 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Last »</button>`;
-    pag.innerHTML = html;
+    stopInfiniteScroll();
+    if (!_hasMore) return;
+    _gridObserver = new IntersectionObserver(async (entries) => {
+        if (entries[0].isIntersecting && !_loadingMore && _hasMore) {
+            _loadingMore = true;
+            try { await loadGridPage(currentPage + 1); }
+            finally { _loadingMore = false; }
+        }
+    }, { rootMargin: '400px' });
+    _gridObserver.observe(sentinel);
 }
 
-function goPage(p) {
-    loadLibrary(Math.max(0, p));
-    document.getElementById('library-section').scrollIntoView({ behavior: 'smooth' });
+function stopInfiniteScroll() {
+    if (_gridObserver) {
+        _gridObserver.disconnect();
+        _gridObserver = null;
+    }
 }
 
 function formatBadge(fmt, stemCount) {
@@ -120,9 +138,9 @@ function formatBadgeInline(fmt, stemCount) {
     return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300">PSARC</span>`;
 }
 
-function renderGridCards(songs, containerId = 'lib-grid') {
+function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
     const grid = document.getElementById(containerId);
-    grid.innerHTML = songs.map(s => {
+    const html = songs.map(s => {
         const title = s.title || s.filename.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
         const artist = s.artist || '';
         const duration = s.duration ? formatTime(s.duration) : '';
@@ -177,6 +195,11 @@ function renderGridCards(songs, containerId = 'lib-grid') {
             </div>
         </div>`;
     }).join('');
+    if (mode === 'append') {
+        grid.insertAdjacentHTML('beforeend', html);
+    } else {
+        grid.innerHTML = html;
+    }
 }
 
 // ── Tree View (server-side) ─────────────────────────────────────────────
@@ -461,6 +484,29 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
+    // Restore master-difficulty slider from persisted value (defaults
+    // to 100 when the key is absent — no behaviour change for users
+    // who've never touched the slider).
+    const masteryPct = typeof data.master_difficulty === 'number'
+        ? Math.max(0, Math.min(100, data.master_difficulty))
+        : 100;
+    const masterySlider = document.getElementById('mastery-slider');
+    const masteryLabel = document.getElementById('mastery-label');
+    if (masterySlider) masterySlider.value = masteryPct;
+    if (masteryLabel) masteryLabel.textContent = masteryPct + '%';
+    highway.setMastery(masteryPct / 100);
+    // Native folder picker — only present when running inside slopsmith-desktop.
+    if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
+        document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
+    }
+}
+
+// Open a native OS folder picker via the Electron bridge (desktop only) and
+// stash the chosen path into the DLC input. User still has to hit Save.
+async function pickDlcFolder() {
+    if (!window.slopsmithDesktop?.pickDirectory) return;
+    const path = await window.slopsmithDesktop.pickDirectory();
+    if (path) document.getElementById('dlc-path').value = path;
 }
 
 async function saveSettings() {
@@ -491,12 +537,13 @@ async function rescanLibrary() {
         const sr = await fetch('/api/scan-status');
         const sd = await sr.json();
         if (sd.running) {
-            status.textContent = `${sd.done} / ${sd.total} scanned...`;
+            const cur = sd.current ? ` · ${sd.current}` : '';
+            status.textContent = `${sd.done} / ${sd.total} scanned${cur}...`;
         } else {
             clearInterval(poll);
             btn.disabled = false;
             btn.textContent = 'Rescan Library';
-            status.textContent = 'Done!';
+            status.textContent = sd.error ? `Error: ${sd.error}` : 'Done!';
             _treeStats = null;
             loadLibrary();
         }
@@ -517,16 +564,70 @@ async function fullRescanLibrary() {
         const sr = await fetch('/api/scan-status');
         const sd = await sr.json();
         if (sd.running) {
-            status.textContent = `${sd.done} / ${sd.total} scanned...`;
+            const cur = sd.current ? ` · ${sd.current}` : '';
+            status.textContent = `${sd.done} / ${sd.total} scanned${cur}...`;
         } else {
             clearInterval(poll);
             btn.disabled = false;
             btn.textContent = 'Full Rescan';
-            status.textContent = 'Done!';
+            status.textContent = sd.error ? `Error: ${sd.error}` : 'Done!';
             _treeStats = null;
             loadLibrary();
         }
     }, 1000);
+}
+
+// ── Plugin Updates ───────────────────────────────────────────────────────
+async function checkPluginUpdates() {
+    const btn = document.getElementById('btn-check-updates');
+    const status = document.getElementById('updates-status');
+    const list = document.getElementById('plugin-updates-list');
+    btn.disabled = true;
+    btn.textContent = 'Checking...';
+    status.textContent = '';
+    list.innerHTML = '';
+    try {
+        const resp = await fetch('/api/plugins/updates');
+        const data = await resp.json();
+        const updates = data.updates || {};
+        const keys = Object.keys(updates);
+        if (keys.length === 0) {
+            status.textContent = 'All plugins are up to date.';
+        } else {
+            status.textContent = `${keys.length} update${keys.length > 1 ? 's' : ''} available`;
+            for (const id of keys) {
+                const u = updates[id];
+                const row = document.createElement('div');
+                row.className = 'flex items-center gap-3 bg-dark-700 rounded-lg px-4 py-2';
+                row.innerHTML = `
+                    <span class="text-sm text-gray-300 flex-1">${u.name} <span class="text-xs text-gray-500">(${u.behind} commit${u.behind > 1 ? 's' : ''} behind — ${u.local} → ${u.remote})</span></span>
+                    <button onclick="updatePlugin('${id}', this)" class="bg-accent/20 hover:bg-accent/30 text-accent-light px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+                list.appendChild(row);
+            }
+        }
+    } catch (e) {
+        status.textContent = 'Failed to check for updates.';
+    }
+    btn.disabled = false;
+    btn.textContent = 'Check for Updates';
+}
+
+async function updatePlugin(pluginId, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Updating...';
+    try {
+        const resp = await fetch(`/api/plugins/${pluginId}/update`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            btn.textContent = 'Updated — restart to apply';
+            btn.className = 'bg-green-900/30 text-green-400 px-3 py-1 rounded-lg text-xs';
+        } else {
+            btn.textContent = 'Failed';
+            btn.title = data.error || '';
+        }
+    } catch (e) {
+        btn.textContent = 'Error';
+    }
 }
 
 // ── Plugin functions loaded dynamically from plugin screen.js files ──────
@@ -594,6 +695,48 @@ function retuneSong(filename, title, tuning, target) {
 const audio = document.getElementById('audio');
 let isPlaying = false;
 let currentFilename = '';
+// Plugin context API — lightweight event bus for plugin integration
+window.slopsmith = Object.assign(new EventTarget(), {
+    currentSong: null,
+    isPlaying: false,
+    _navParams: {},
+    navigate(screenId, params) {
+        this._navParams = params || {};
+        showScreen(screenId);
+    },
+    getNavParams() {
+        const p = this._navParams;
+        this._navParams = {};
+        return p;
+    },
+    emit(event, detail) {
+        this.dispatchEvent(new CustomEvent(event, { detail }));
+    },
+    on(event, fn) { this.addEventListener(event, fn); },
+    off(event, fn) { this.removeEventListener(event, fn); }
+});
+
+// Initialise volume from persisted preference (matches lefty / invertHighway /
+// renderScale / showLyrics convention). Falls back to the slider's default.
+(function _initVolume() {
+    const slider = document.getElementById('volume');
+    const label = document.getElementById('vol-label');
+    const stored = parseFloat(localStorage.getItem('volume'));
+    const v = Number.isFinite(stored) ? stored : parseFloat(slider.value);
+    slider.value = v;
+    label.textContent = v + '%';
+    audio.volume = v / 100;
+})();
+
+// Re-sync audio volume from the slider every time a new source finishes
+// loading metadata. Belt + suspenders — some combinations of plugin audio-
+// graph routing and media-element swaps reset audio.volume to 1.0, which
+// would leave the slider showing one value while audio plays at another
+// (see slopsmith#54).
+audio.addEventListener('loadedmetadata', () => {
+    const slider = document.getElementById('volume');
+    if (slider) audio.volume = parseFloat(slider.value) / 100;
+});
 
 // Debug audio issues
 audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
@@ -604,7 +747,21 @@ audio.addEventListener('error', (e) => {
 });
 audio.addEventListener('stalled', () => console.log('Audio stalled at', audio.currentTime.toFixed(1)));
 audio.addEventListener('waiting', () => console.log('Audio waiting/buffering at', audio.currentTime.toFixed(1)));
-audio.addEventListener('ended', () => { console.log('Audio ended'); isPlaying = false; document.getElementById('btn-play').textContent = '▶ Play'; });
+audio.addEventListener('ended', () => {
+    console.log('Audio ended'); isPlaying = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:ended', { time: audio.currentTime });
+});
+audio.addEventListener('play', () => {
+    window.slopsmith.isPlaying = true;
+    window.slopsmith.emit('song:play', { time: audio.currentTime });
+});
+audio.addEventListener('pause', () => {
+    if (!isPlaying) return;
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:pause', { time: audio.currentTime });
+});
 
 // Abort controller for cancelling pending requests when entering player
 let artAbortController = null;
@@ -670,6 +827,7 @@ function changeArrangement(index) {
         };
 
         highway.reconnect(currentFilename, index);
+        window.slopsmith.emit('arrangement:changed', { index, filename: currentFilename });
     }
 }
 
@@ -684,11 +842,318 @@ function togglePlay() {
 }
 
 function seekBy(s) { audio.currentTime = Math.max(0, audio.currentTime + s); }
-function setVolume(v) { audio.volume = v / 100; document.getElementById('vol-label').textContent = v + '%'; }
+function setVolume(v) {
+    audio.volume = v / 100;
+    document.getElementById('vol-label').textContent = v + '%';
+    localStorage.setItem('volume', String(v));
+}
 function setSpeed(v) {
     audio.playbackRate = parseFloat(v);
     document.getElementById('speed-label').textContent = parseFloat(v).toFixed(2) + 'x';
 }
+// Master-difficulty slider (slopsmith#48). Persists partial via
+// /api/settings — the POST handler merges only the keys present, so
+// this fire-and-forget call doesn't clobber dlc_dir or other settings.
+//
+// Debounced trailing-edge (300ms) so dragging the slider — which fires
+// oninput per pixel — doesn't flood the server with concurrent writes
+// to config.json. highway.setMastery() still fires every oninput so
+// the chart re-filters in real time; only disk persistence waits.
+let _masteryPersistTimer = null;
+function _persistMastery(pct) {
+    if (_masteryPersistTimer) clearTimeout(_masteryPersistTimer);
+    _masteryPersistTimer = setTimeout(() => {
+        _masteryPersistTimer = null;
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ master_difficulty: pct }),
+        }).catch(() => { /* best-effort — next setMastery() will retry */ });
+    }, 300);
+}
+function setMastery(v) {
+    // Guard + clamp: v might be a slider string, a programmatic call
+    // from a plugin, or a restored settings value with a bad shape.
+    // Don't let NaN hit the label (would show "NaN%") or the POST.
+    const parsed = parseInt(v, 10);
+    if (!Number.isFinite(parsed)) return;
+    const pct = Math.max(0, Math.min(100, parsed));
+    document.getElementById('mastery-label').textContent = pct + '%';
+    highway.setMastery(pct / 100);
+    _persistMastery(pct);
+}
+// Reflect phrase-data availability on the slider after every `ready`.
+// The server omits the `phrases` message entirely for single-level
+// sources (GP imports, legacy sloppak), so hasPhraseData() is the
+// right signal to enable/disable the slider.
+function _applyMasteryAvailability(hasPhraseData) {
+    const slider = document.getElementById('mastery-slider');
+    if (!slider) return;
+    if (hasPhraseData) {
+        slider.disabled = false;
+        slider.title = 'Master difficulty — low = simpler chart, high = full';
+    } else {
+        slider.disabled = true;
+        slider.title = 'Source chart has a single difficulty level — slider disabled';
+    }
+}
+if (window.slopsmith) {
+    // slopsmith's event bus dispatches CustomEvent with the payload in
+    // event.detail (see EventTarget setup around line 699), so the
+    // handler receives an Event, not the raw payload.
+    window.slopsmith.on('song:ready', (e) => {
+        _applyMasteryAvailability(!!e.detail?.hasPhraseData);
+        // Auto mode: re-evaluate the active renderer against the
+        // newly-loaded song. The picker's current <option> value is the
+        // source of truth here — localStorage is a persistence mirror
+        // that can throw in private / sandboxed contexts, and the
+        // picker already reflects fresh-install / post-cleanup
+        // fallthroughs to 'auto' even when writes failed.
+        const sel = document.getElementById('viz-picker');
+        if (sel && sel.value === 'auto') _autoMatchViz();
+    });
+    // Highway signals when it's auto-reverted to the default renderer
+    // after a broken plugin (init failure or repeated draw failures).
+    // Sync the picker + persisted selection so the UI stops advertising
+    // the broken choice and the user doesn't hit the same failure on
+    // next reload.
+    window.slopsmith.on('viz:reverted', (e) => {
+        const sel = document.getElementById('viz-picker');
+        if (sel) sel.value = 'default';
+        try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
+        console.warn(
+            `viz picker: reverted to default renderer (${e.detail?.reason || 'unknown'}).`
+        );
+    });
+}
+
+// ── Visualization picker (slopsmith#36) ─────────────────────────────────
+//
+// Discovers viz plugins via /api/plugins and adds them to the #viz-picker
+// dropdown. A viz plugin declares itself by setting `"type": "visualization"`
+// in its plugin.json AND exposing a factory function on
+// window.slopsmithViz_<id> that returns an object matching the setRenderer
+// contract ({init, draw, resize, destroy}).
+//
+// The "default" option in the dropdown is the built-in 2D highway that
+// lives inside createHighway(); selecting it calls setRenderer(null) which
+// restores the default renderer.
+async function _populateVizPicker(plugins) {
+    const sel = document.getElementById('viz-picker');
+    if (!sel) return;
+    // Clear any previously-appended plugin options so calling this
+    // function more than once (e.g. from DevTools, or a hot-reloaded
+    // plugin) doesn't produce duplicates. The built-in "auto" and
+    // "default" options are static markup — preserve them.
+    const BUILTIN_OPT_VALUES = new Set(['auto', 'default']);
+    Array.from(sel.options).forEach(opt => {
+        if (!BUILTIN_OPT_VALUES.has(opt.value)) sel.removeChild(opt);
+    });
+    // Accept a pre-fetched plugins array (normal startup path reuses
+    // loadPlugins' fetch). Fall back to our own fetch if called
+    // standalone — e.g. from the DevTools console for debugging.
+    if (!Array.isArray(plugins)) {
+        plugins = [];
+        try {
+            const resp = await fetch('/api/plugins');
+            if (resp.ok) plugins = await resp.json();
+        } catch (e) {
+            console.warn('viz picker: /api/plugins fetch failed', e);
+        }
+    }
+    const vizPlugins = plugins.filter(p => p && p.type === 'visualization');
+    // "default" is reserved for the built-in 2D renderer option and
+    // "auto" is reserved for the Auto-mode entry — both already in the
+    // <select>. A plugin with either id would collide: the
+    // restore-from-localStorage lookup would find the built-in entry,
+    // dragging the plugin into never-selected land silently. Fail
+    // loudly instead.
+    const RESERVED_IDS = new Set(['default', 'auto']);
+    for (const p of vizPlugins) {
+        if (RESERVED_IDS.has(p.id)) {
+            console.error(`viz picker: plugin id '${p.id}' collides with a reserved built-in picker entry ('auto' = Auto mode, 'default' = built-in 2D highway); rename the plugin's id in plugin.json to include it in the picker.`);
+            continue;
+        }
+        // Skip entries where the plugin script hasn't exposed a factory —
+        // likely means the script failed to load, or the plugin declared
+        // itself as a viz without shipping the factory yet.
+        const factoryName = 'slopsmithViz_' + p.id;
+        if (typeof window[factoryName] !== 'function') {
+            console.warn(`viz picker: plugin '${p.id}' has type=visualization but ${factoryName} is not a function; skipping`);
+            continue;
+        }
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name || p.id;
+        sel.appendChild(opt);
+    }
+    // Restore previous selection if still available. Direct option
+    // scan instead of a CSS-selector lookup so we don't depend on
+    // CSS.escape (missing in some test environments / older runtimes)
+    // and so a weird saved string (e.g. with a quote) can't throw.
+    // localStorage.getItem can itself throw when storage is blocked
+    // (private mode, sandboxed iframes, some strict test runners);
+    // fall back to null so the startup chain doesn't abort.
+    let saved = null;
+    try { saved = localStorage.getItem('vizSelection'); }
+    catch (e) { console.warn('viz picker: unable to read vizSelection', e); }
+    const savedMatches = saved && Array.from(sel.options).some(opt => opt.value === saved);
+    if (savedMatches) {
+        sel.value = saved;
+        // 'default' needs no setViz — the highway already starts with
+        // the built-in renderer. 'auto' runs setViz so _autoMatchViz
+        // fires, though it's a no-op before the first song_info frame.
+        if (saved !== 'default') setViz(saved);
+    } else if (saved) {
+        // Saved selection references an option that no longer exists —
+        // plugin uninstalled since last session, renamed, or the plugin
+        // script failed to register its factory this time. Clear the
+        // stale value so we don't keep trying the same missing viz on
+        // every reload, and fall through to the fresh-install default
+        // below.
+        try { localStorage.removeItem('vizSelection'); }
+        catch (_) { /* storage blocked; ignore */ }
+        saved = null;
+    }
+    if (!saved) {
+        // Fresh install (or post-cleanup fallthrough): default to Auto
+        // so the arrangement-matching plugins (piano on Keys songs,
+        // drums on Drums songs, ...) take over without a manual pick.
+        // Users who actively selected 'default' keep 'default' —
+        // savedMatches above handles that.
+        sel.value = 'auto';
+        try { localStorage.setItem('vizSelection', 'auto'); } catch (_) {}
+    }
+    // Close a startup race: if playback began before loadPlugins
+    // finished, song:ready already fired while the picker had no
+    // plugin options — _autoMatchViz saw no candidates and left the
+    // default active. Now that plugins are registered, re-evaluate
+    // against whatever song is currently loaded (a no-op when no song
+    // has been loaded yet, since highway.getSongInfo() returns {}).
+    if (sel.value === 'auto') _autoMatchViz();
+}
+
+function setViz(id) {
+    // Helper: reset the UI and persisted selection to the built-in
+    // "default" entry. Called whenever the requested viz can't be
+    // applied (missing factory, factory threw, factory returned a
+    // non-conforming renderer) so the picker, localStorage, and the
+    // highway's active renderer stay in sync.
+    const fallbackToDefault = () => {
+        try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
+        const sel = document.getElementById('viz-picker');
+        if (sel) sel.value = 'default';
+        highway.setRenderer(null);
+    };
+
+    if (id === 'default' || !id) {
+        try { localStorage.setItem('vizSelection', id || 'default'); } catch (_) {}
+        highway.setRenderer(null);
+        return;
+    }
+    if (id === 'auto') {
+        try { localStorage.setItem('vizSelection', 'auto'); } catch (_) {}
+        _autoMatchViz();
+        return;
+    }
+    const factory = window['slopsmithViz_' + id];
+    if (typeof factory !== 'function') {
+        console.error(`viz picker: factory slopsmithViz_${id} not available`);
+        fallbackToDefault();
+        return;
+    }
+    let renderer;
+    try { renderer = factory(); }
+    catch (e) {
+        console.error(`viz picker: factory slopsmithViz_${id} threw`, e);
+        fallbackToDefault();
+        return;
+    }
+    // Validate shape — highway.setRenderer will itself fall back to
+    // default on a bad renderer, but without this check the UI and
+    // localStorage would still advertise the broken selection.
+    if (!renderer || typeof renderer.draw !== 'function') {
+        console.error(`viz picker: factory slopsmithViz_${id} returned an invalid renderer (missing draw)`);
+        fallbackToDefault();
+        return;
+    }
+    // Persist only once we know the renderer is valid.
+    try { localStorage.setItem('vizSelection', id); } catch (_) {}
+    highway.setRenderer(renderer);
+}
+
+// Auto mode: evaluate each registered viz factory's static
+// `matchesArrangement(songInfo)` predicate and install the first
+// matching renderer. No match → fall back to the built-in 2D highway.
+//
+// vizSelection stays 'auto' across invocations so the next song:ready
+// re-evaluates. An explicit picker choice overrides Auto by persisting
+// a different vizSelection.
+//
+// Enumerates viz plugins by walking the picker's own <option> list —
+// that's the canonical set built by _populateVizPicker above and keeps
+// us from needing a second module-level registry.
+function _autoMatchViz() {
+    const sel = document.getElementById('viz-picker');
+    if (!sel) return;
+    const songInfo = (typeof highway !== 'undefined' && typeof highway.getSongInfo === 'function')
+        ? (highway.getSongInfo() || {}) : {};
+    // Options are stable in DOM order, which matches what users see in
+    // the picker. The underlying order comes from /api/plugins →
+    // _populateVizPicker, and /api/plugins reflects the order the
+    // plugin loader discovered plugins in — plugins/__init__.py walks
+    // `sorted(plugins_base_dir.iterdir())`, i.e. sorted by the on-disk
+    // PLUGIN DIRECTORY name (e.g. "slopsmith-plugin-drums" sorts
+    // before "slopsmith-plugin-piano"), not by the plugin id declared
+    // in plugin.json. Two consequences worth noting:
+    //   1. First match wins among registered viz plugins — keep each
+    //      plugin's matchesArrangement predicate narrow to avoid
+    //      stealing songs from more specialized viz.
+    //   2. If you need a strict priority when multiple plugins match
+    //      the same song, name the higher-priority plugin's directory
+    //      earlier alphabetically. The picker dropdown reveals the
+    //      actual tiebreaker at a glance.
+    const candidateIds = Array.from(sel.options)
+        .map(o => o.value)
+        .filter(v => v !== 'auto' && v !== 'default');
+    for (const id of candidateIds) {
+        const factory = window['slopsmithViz_' + id];
+        if (typeof factory !== 'function') continue;
+        const predicate = factory.matchesArrangement;
+        if (typeof predicate !== 'function') continue;
+        let matched = false;
+        try { matched = !!predicate(songInfo); }
+        catch (err) {
+            console.error(`viz auto: matchesArrangement for ${id} threw`, err);
+            continue;
+        }
+        if (!matched) continue;
+        let renderer;
+        try { renderer = factory(); }
+        catch (err) {
+            console.error(`viz auto: factory slopsmithViz_${id} threw`, err);
+            continue;
+        }
+        if (!renderer || typeof renderer.draw !== 'function') {
+            console.error(`viz auto: factory slopsmithViz_${id} returned an invalid renderer (missing draw)`);
+            continue;
+        }
+        // Deliberately NOT persisting id — vizSelection stays 'auto' so
+        // the next song:ready re-evaluates against the new arrangement.
+        highway.setRenderer(renderer);
+        return;
+    }
+    // No match — restore the built-in 2D highway. setRenderer(null) is
+    // a no-op when the default is already active. KNOWN LIMITATION:
+    // when the previous Auto pick was a WebGL renderer, the canvas has
+    // been locked to 'webgl' by that renderer's init; reverting to the
+    // default 2D renderer will fail silently (see CLAUDE.md "first
+    // context wins"). That's the same limitation manual picker swaps
+    // already have — a future wave will teach highway to recreate the
+    // canvas on context-type change.
+    highway.setRenderer(null);
+}
+
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
 
 // ── A-B Loop ────────────────────────────────────────────────────────────
@@ -1074,6 +1539,17 @@ async function pollScanStatus() {
     try {
         const resp = await fetch('/api/scan-status');
         const data = await resp.json();
+        if (data.stage === 'error' && data.error) {
+            // Surface the error in the banner and stop polling.
+            showScanBanner();
+            const file = document.getElementById('scan-file');
+            const prog = document.getElementById('scan-progress');
+            if (file) { file.textContent = 'Scan failed: ' + data.error; file.classList.add('text-red-400'); }
+            if (prog) prog.textContent = 'Error';
+            clearInterval(_scanPollId);
+            _scanPollId = null;
+            return;
+        }
         if (data.running) {
             showScanBanner();
             const pct = data.total > 0 ? Math.round(data.done / data.total * 100) : 0;
@@ -1083,8 +1559,8 @@ async function pollScanStatus() {
             if (bar) bar.style.width = pct + '%';
             if (prog) prog.textContent = `${data.done} / ${data.total} (${pct}%)`;
             if (file) {
-                const name = data.current.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
-                file.textContent = name || 'Processing...';
+                const name = (data.current || '').replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
+                file.textContent = name || (data.stage === 'listing' ? 'Listing DLC folder...' : 'Processing...');
             }
         } else {
             if (document.getElementById('scan-banner')) {
@@ -1110,9 +1586,10 @@ async function checkScanAndLoad() {
 
 // ── Plugin loader ───────────────────────────────────────────────────────
 async function loadPlugins() {
+    let plugins;
     try {
         const resp = await fetch('/api/plugins');
-        const plugins = await resp.json();
+        plugins = await resp.json();
 
         const navContainer = document.getElementById('nav-plugins');
         const mobileNavContainer = document.getElementById('mobile-nav-plugins');
@@ -1199,11 +1676,26 @@ async function loadPlugins() {
         }
     } catch (e) {
         console.error('Failed to load plugins:', e);
+        return null;
     }
+    return plugins;
 }
 
 // Load library on start
-loadPlugins().then(() => {
+loadPlugins().then((plugins) => {
     setLibView('grid');
     checkScanAndLoad();
+    // Viz picker depends on plugin scripts having loaded (to find
+    // window.slopsmithViz_<id> factories), so run it after loadPlugins.
+    // Reuse the plugin list loadPlugins just fetched — no need to
+    // round-trip /api/plugins a second time.
+    _populateVizPicker(plugins);
+    fetch('/api/version')
+        .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+        .then(d => {
+            const el = document.getElementById('app-version');
+            const v = typeof d.version === 'string' ? d.version.trim() : '';
+            if (el && v && v.toLowerCase() !== 'unknown') el.textContent = 'v' + v;
+        })
+        .catch(() => {});
 });

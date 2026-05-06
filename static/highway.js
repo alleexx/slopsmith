@@ -6,6 +6,10 @@ function createHighway() {
     let canvas, ctx, ws;
     let currentTime = 0;
     let animFrame = null;
+    let _connectOpts = {};
+    let _resizeContainer = null;
+    let _resizeHandler = null;
+    let _onLyricsChange = null;
 
     // Song data (populated via WebSocket)
     let songInfo = {};
@@ -19,7 +23,24 @@ function createHighway() {
     let toneChanges = [];
     let toneBase = "";
     let ready = false;
-    let showLyrics = true;
+    // Master-difficulty (slopsmith#48). _phrases stays null as a
+    // "slider disabled" sentinel when the source chart has no ladder
+    // data (GP imports, legacy sloppak) — the server omits the
+    // `phrases` message entirely in that case. When populated, the
+    // filter maps the slider fraction to a per-phrase level index and
+    // stages _filteredNotes / _filteredChords for the render loop.
+    // _filteredNotes === null means "fall through to flat notes" —
+    // either no phrase data or filter not rebuilt yet.
+    let _phrases = null;
+    // Default to full chart. Persistence lives in the caller (app.js
+    // loadSettings, or a splitscreen plugin managing its own panel
+    // state) so multiple createHighway() instances stay truly
+    // per-instance — no shared localStorage key to race on.
+    let _mastery = 1;
+    let _filteredNotes = null;
+    let _filteredChords = null;
+    let _filteredAnchors = null;
+    let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
     let _inverted = localStorage.getItem('invertHighway') === 'true';
@@ -66,8 +87,11 @@ function createHighway() {
     let displayMaxFret = 12;  // rightmost visible fret (smoothed)
 
     function getAnchorAt(t) {
-        let a = anchors[0] || { fret: 1, width: 4 };
-        for (const anc of anchors) {
+        // Same master-difficulty fallback as the render loops — the
+        // anchor ladder pairs with the note ladder.
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
+        let a = src[0] || { fret: 1, width: 4 };
+        for (const anc of src) {
             if (anc.time > t) break;
             a = anc;
         }
@@ -76,8 +100,9 @@ function createHighway() {
 
     function getMaxFretInWindow(t) {
         // Find the highest fret needed across all anchors visible on screen
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
         let maxFret = 0;
-        for (const anc of anchors) {
+        for (const anc of src) {
             if (anc.time > t + VISIBLE_SECONDS) break;
             if (anc.time + 2 < t) continue;  // skip anchors well in the past
             const top = anc.fret + anc.width;
@@ -106,7 +131,11 @@ function createHighway() {
 
     /** Call while lefty mirror transform is active; keeps glyphs readable. */
     function fillTextReadable(text, x, y) {
-        if (!canvas) return;
+        // ctx may be null when the 2D context was never acquired
+        // (canvas already locked to WebGL). No-op in that case —
+        // alternatives would be throwing, which breaks plugin hooks
+        // that call this after a context-type mismatch.
+        if (!canvas || !ctx) return;
         const W = canvas.width;
         if (!_lefty) {
             ctx.fillText(text, x, y);
@@ -119,48 +148,312 @@ function createHighway() {
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
-    let _drawCount = 0;
+    //
+    // slopsmith#36 — swappable renderers.
+    //
+    // The default renderer below is the original 2D canvas highway. Its
+    // methods still reach into the factory closure (ctx, beats, notes,
+    // _drawHooks, etc.) to avoid rewriting every helper; it's not
+    // "isolated," just shaped as the contract. Custom renderers from
+    // plugins (3D, tab, fretboard, future "keys"/"drums") pass through
+    // setRenderer() and consume the bundle instead of the closure —
+    // they stay self-contained and never touch the factory's `ctx`.
+    //
+    // Lifecycle: setRenderer(r) -> previous.destroy() -> r.init(canvas,
+    // bundle) -> per frame r.draw(bundle) -> on resize r.resize(w, h) ->
+    // on stop or swap r.destroy(). Renderer owns its rendering context
+    // (2D, WebGL, DOM overlay). Factory owns canvas element, rAF, WS,
+    // data state, resize subscription, _drawHooks for 2D compositing.
+    //
+    // Contract for setRenderer(r): r is an object with at minimum
+    // {draw(bundle)}. init / resize / destroy are optional. Pass null
+    // or undefined to restore the default renderer.
+    //
+    // The bundle (see _makeBundle) is a per-frame snapshot of factory
+    // state — includes difficulty-filtered note / chord / anchor arrays
+    // so renderers never touch _filteredX internals directly. Arrays
+    // are live references (performance), NOT copies — renderers must
+    // treat them as read-only.
+    let _renderer = null;
+
+    function _makeBundle() {
+        // Snapshot of current factory state passed to each renderer call.
+        // Arrays and songInfo are LIVE references, not copies — the bundle
+        // itself is rebuilt each frame but its `notes`, `chords`,
+        // `anchors`, `beats`, etc. point at closure state. Renderers
+        // MUST NOT mutate these; treat them as read-only. We don't
+        // Object.freeze or deep-copy for per-frame allocation cost reasons.
+        return {
+            // Timing
+            currentTime,
+            songInfo,
+            isReady: ready,
+
+            // Chart content (filter-aware — difficulty-filtered arrays
+            // preferred; raw arrays are the fallback when no ladder data).
+            notes: _filteredNotes !== null ? _filteredNotes : notes,
+            chords: _filteredChords !== null ? _filteredChords : chords,
+            anchors: _filteredAnchors !== null ? _filteredAnchors : anchors,
+            beats,
+            sections,
+            chordTemplates,
+            lyrics,
+            toneChanges,
+            toneBase,
+
+            // Master-difficulty (slopsmith#48)
+            mastery: _mastery,
+            hasPhraseData: !!(_phrases && _phrases.length > 0),
+
+            // Display flags
+            inverted: _inverted,
+            lefty: _lefty,
+            renderScale: _renderScale,
+            lyricsVisible: showLyrics,
+
+            // 2D-style helpers (renderers that don't need these can ignore).
+            // `fillTextUnmirrored` is deliberately NOT exposed here —
+            // the factory-level version writes to the default renderer's
+            // closure ctx, which is null for custom renderers. Renderers
+            // that need lefty-aware text should check `bundle.lefty` and
+            // apply the mirror transform themselves on their own context.
+            project,
+            fretX,
+        };
+    }
+
+    const _defaultRenderer = {
+        _ctxWarned: false,
+        init(canvasEl /* , bundle */) {
+            // getContext('2d') returns null when the canvas is already
+            // locked to another context type (e.g. a WebGL viz plugin
+            // grabbed it first). Once that happens the 2D renderer can't
+            // recover on the same canvas — surface a single clear error
+            // and skip drawing. A future revision will recreate the
+            // canvas element on renderer-type swap to avoid this.
+            ctx = canvasEl.getContext('2d');
+            if (!ctx && !this._ctxWarned) {
+                console.error(
+                    'Default 2D renderer: canvas.getContext("2d") returned null ' +
+                    '— the canvas is locked to another context type. ' +
+                    'Reload the page to restore the highway.'
+                );
+                this._ctxWarned = true;
+            }
+        },
+        draw(/* bundle */) {
+            // Still reads from the factory closure directly — the bundle
+            // is shaped for custom renderers, not used here. Keeping the
+            // default renderer's body unchanged from the pre-refactor
+            // draw() preserves pixel-level parity with current main.
+            if (!canvas || !ready || !ctx) return;
+            try {
+                const W = canvas.width;
+                const H = canvas.height;
+                ctx.fillStyle = BG;
+                ctx.fillRect(0, 0, W, H);
+
+                const anchor = getAnchorAt(currentTime);
+                updateSmoothAnchor(anchor, 1 / 60);
+
+                ctx.save();
+                if (_lefty) {
+                    ctx.translate(W, 0);
+                    ctx.scale(-1, 1);
+                }
+
+                drawHighway(W, H);
+                drawFretLines(W, H);
+                drawBeats(W, H);
+                drawStrings(W, H);
+                drawSustains(W, H);
+                drawNowLine(W, H);
+                drawNotes(W, H);
+                drawChords(W, H);
+                drawFretNumbers(W, H);
+
+                // Plugin draw hooks (same coordinate system as the highway).
+                // Hooks are a 2D-only contract — the default renderer owns
+                // their invocation. Custom renderers on non-2D contexts
+                // (e.g. WebGL) don't call them; the factory doesn't
+                // invoke hooks on their behalf.
+                for (const hook of _drawHooks) {
+                    try { hook(ctx, W, H); } catch (e) { /* ignore */ }
+                }
+
+                ctx.restore();
+
+                // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
+                if (showLyrics) drawLyrics(W, H);
+            } catch (e) {
+                console.error('draw error:', e);
+            }
+        },
+        resize(/* w, h */) {
+            // no-op; canvas dimension change is handled by the factory,
+            // and the 2D context doesn't maintain persistent state we'd
+            // need to rebuild here.
+        },
+        destroy() {
+            // Leave ctx intact. Helper paths like fillTextReadable /
+            // api.fillTextUnmirrored may still be called while another
+            // renderer is active or after stop() (e.g. a residual draw
+            // hook, plugin cleanup code). Forcing ctx to null would
+            // make those calls throw. A subsequent init() re-assigns
+            // ctx via canvasEl.getContext('2d') — the browser returns
+            // the same cached context for the same canvas, so there's
+            // nothing to "refresh" by nulling. Reset the warn-once
+            // guard so a fresh init on a fresh canvas is a new
+            // opportunity to succeed or fail.
+            this._ctxWarned = false;
+        },
+    };
+
+    // Tracks consecutive renderer.draw failures so a permanently broken
+    // renderer auto-reverts to default instead of spamming the console
+    // every frame. Reset on every successful draw and whenever a new
+    // renderer is installed.
+    let _rendererDrawFailures = 0;
+    const MAX_RENDERER_DRAW_FAILURES = 3;
+
+    // True only while the current renderer has had a successful init
+    // since its last destroy (or was freshly installed but never init'd
+    // because canvas was null). Gates destroy calls so an uninit'd
+    // renderer doesn't receive spurious destroys — the restore-on-
+    // page-load flow relies on this: setRenderer can run before init.
+    let _rendererInited = false;
+
+    function _destroyCurrentIfInited() {
+        if (_renderer && _rendererInited && typeof _renderer.destroy === 'function') {
+            try { _renderer.destroy(); }
+            catch (e) { console.error('renderer destroy:', e); }
+        }
+        _rendererInited = false;
+    }
+
+    function _emitVizReverted(reason) {
+        // Notify listeners (e.g. app.js's viz picker, splitscreen's
+        // per-panel picker in Wave C) that the factory auto-reverted
+        // to the default renderer — so the UI / persisted selection
+        // don't keep advertising the broken plugin.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try { window.slopsmith.emit('viz:reverted', { reason }); }
+            catch (e) { console.error('viz:reverted emit:', e); }
+        }
+    }
+
+    function _setRenderer(r) {
+        _destroyCurrentIfInited();
+        // null/undefined reverts to default. Anything else must provide
+        // at minimum a draw(bundle) function — without it the rAF loop
+        // would throw every frame. Log once and fall back to default
+        // rather than accepting a broken renderer.
+        let next;
+        if (r == null) {
+            next = _defaultRenderer;
+        } else if (typeof r.draw === 'function') {
+            next = r;
+        } else {
+            console.error('setRenderer: renderer missing draw(bundle) function; reverting to default.');
+            next = _defaultRenderer;
+        }
+        _renderer = next;
+        _rendererDrawFailures = 0;
+        // Defer init/resize until the canvas is available. setRenderer
+        // can legitimately be called before api.init() runs (e.g. app.js
+        // restoring a saved picker selection at page load, before any
+        // song has been played). api.init() will re-run these when it
+        // assigns the canvas.
+        if (!canvas) return;
+        const bundle = _makeBundle();
+        // A renderer without an init() function is treated as ready
+        // by default (it simply has no setup to do). If an init()
+        // exists, only flip the flag true when it returns without
+        // throwing — otherwise a later destroy would run on an
+        // effectively-uninitialized renderer.
+        let initSucceeded = typeof _renderer.init !== 'function';
+        if (typeof _renderer.init === 'function') {
+            try {
+                _renderer.init(canvas, bundle);
+                initSucceeded = true;
+            }
+            catch (e) {
+                console.error('renderer init:', e);
+                // Init may have partially allocated GPU/DOM resources
+                // before throwing. Run destroy best-effort to release
+                // whatever it got — renderer's destroy contract already
+                // requires handling partial state gracefully. Then
+                // revert to the default renderer so the user isn't
+                // stranded on a broken viz, and notify the UI so the
+                // picker + localStorage sync back to 'default'.
+                if (_renderer !== _defaultRenderer) {
+                    if (typeof _renderer.destroy === 'function') {
+                        try { _renderer.destroy(); }
+                        catch (destroyErr) {
+                            console.error('renderer destroy after init failure:', destroyErr);
+                        }
+                    }
+                    _renderer = _defaultRenderer;
+                    _emitVizReverted('init-failure');
+                    if (typeof _renderer.init === 'function') {
+                        try {
+                            _renderer.init(canvas, _makeBundle());
+                            initSucceeded = true;
+                        }
+                        catch (e2) {
+                            console.error('default renderer init after revert:', e2);
+                        }
+                    } else {
+                        initSucceeded = true;
+                    }
+                }
+            }
+        }
+        _rendererInited = initSucceeded;
+        if (!_rendererInited) return;
+        if (typeof _renderer.resize === 'function') {
+            try { _renderer.resize(canvas.width, canvas.height); }
+            catch (e) { console.error('renderer resize:', e); }
+        }
+    }
+
     function draw() {
         animFrame = requestAnimationFrame(draw);
-        if (!canvas || !ready) return;
+        if (!canvas || !_renderer) return;
+        // Match pre-refactor behaviour: skip draw until WS ready fires.
+        // This gates out the brief "arrays cleared, WS reconnecting"
+        // window during playSong / reconnect. Renderers that want to
+        // draw a loading state can still opt in via the `isReady`
+        // field on the bundle passed to a custom pre-ready handler —
+        // we'd need to widen the contract to support that, out of
+        // scope here. Default 2D renderer also checks `ready` in its
+        // draw body (defence in depth).
+        if (!ready) return;
+        // Skip bundle allocation when the default renderer is active —
+        // it reads closure state directly and ignores the bundle.
+        // _makeBundle at 60fps was a steady GC churn for the common
+        // case where no custom renderer is installed.
+        const bundle = _renderer === _defaultRenderer ? undefined : _makeBundle();
         try {
-        const W = canvas.width;
-        const H = canvas.height;
-        if (_drawCount++ < 3) console.log(`draw: W=${W} H=${H} t=${currentTime.toFixed(2)} notes=${notes.length}`);
-        ctx.fillStyle = BG;
-        ctx.fillRect(0, 0, W, H);
-
-        const anchor = getAnchorAt(currentTime);
-        updateSmoothAnchor(anchor, 1 / 60);
-
-        ctx.save();
-        if (_lefty) {
-            ctx.translate(W, 0);
-            ctx.scale(-1, 1);
-        }
-
-        drawHighway(W, H);
-        drawFretLines(W, H);
-        drawBeats(W, H);
-        drawStrings(W, H);
-        drawSustains(W, H);
-        drawNowLine(W, H);
-        drawNotes(W, H);
-        drawChords(W, H);
-        drawFretNumbers(W, H);
-
-        // Plugin draw hooks (same coordinate system as the highway)
-        for (const hook of _drawHooks) {
-            try { hook(ctx, W, H); } catch (e) { /* ignore */ }
-        }
-
-        ctx.restore();
-
-        // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
-        if (showLyrics) drawLyrics(W, H);
-
+            _renderer.draw(bundle);
+            _rendererDrawFailures = 0;
         } catch (e) {
-            console.error('draw error:', e);
+            _rendererDrawFailures += 1;
+            console.error('renderer draw:', e);
+            // Self-heal: a plugin whose draw() throws every frame
+            // would otherwise spam the console and leave the canvas
+            // blank indefinitely. After a short streak of failures,
+            // revert to the built-in renderer so the user at least
+            // gets the default highway back. 2D default is known-safe.
+            if (_rendererDrawFailures >= MAX_RENDERER_DRAW_FAILURES &&
+                _renderer !== _defaultRenderer) {
+                console.error(
+                    'renderer draw: failed ' + _rendererDrawFailures +
+                    ' frames in a row; reverting to default renderer.'
+                );
+                _setRenderer(_defaultRenderer);
+                _emitVizReverted('draw-failure');
+            }
         }
     }
 
@@ -309,6 +602,57 @@ function createHighway() {
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             fillTextReadable('0', W/2, y);
+
+            // Technique labels on open strings — PM, H/P/T, tremolo, and
+            // accent markers are all meaningful on fret 0. Bend and slide
+            // are omitted because they reference a fret position that the
+            // centered bar doesn't visually convey. Matches the sz<14 gate
+            // the fretted path uses so labels don't render on tiny bars.
+            // Fixes #21.
+            if (sz >= 14) {
+                // H / P / T above
+                if (hammerOn || pullOff || tap) {
+                    const label = tap ? 'T' : (hammerOn ? 'H' : 'P');
+                    ctx.fillStyle = '#fff';
+                    ctx.font = `bold ${Math.max(9, sz * 0.3) | 0}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'bottom';
+                    fillTextReadable(label, W/2, y - barH/2 - 4);
+                }
+                // PM below
+                if (palmMute) {
+                    ctx.fillStyle = '#aaa';
+                    ctx.font = `bold ${Math.max(8, sz * 0.25) | 0}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'top';
+                    fillTextReadable('PM', W/2, y + barH/2 + 2);
+                }
+                // Tremolo (wavy line above)
+                if (tremolo) {
+                    const ty = y - barH/2 - 6;
+                    ctx.strokeStyle = '#ff0';
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    for (let i = -3; i <= 3; i++) {
+                        const wx = W/2 + i * sz * 0.08;
+                        const wy = ty + Math.sin(i * 2) * 3;
+                        if (i === -3) ctx.moveTo(wx, wy);
+                        else ctx.lineTo(wx, wy);
+                    }
+                    ctx.stroke();
+                }
+                // Accent caret above
+                if (accent) {
+                    const ay2 = y - barH/2 - 4;
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(W/2 - sz * 0.2, ay2 + 3);
+                    ctx.lineTo(W/2, ay2 - 2);
+                    ctx.lineTo(W/2 + sz * 0.2, ay2 + 3);
+                    ctx.stroke();
+                }
+            }
             return;
         }
 
@@ -466,7 +810,12 @@ function createHighway() {
     }
 
     function drawSustains(W, H) {
-        for (const n of notes) {
+        // Same master-difficulty fallback as drawNotes/drawChords —
+        // without this, sustain bars for filtered-out notes would
+        // still render, leaving orphan rectangles where no note head
+        // is drawn.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
+        for (const n of src) {
             if (n.sus <= 0.01) continue;
             const end = n.t + n.sus;
             if (end < currentTime || n.t > currentTime + VISIBLE_SECONDS) continue;
@@ -494,20 +843,25 @@ function createHighway() {
     }
 
     function drawNotes(W, H) {
+        // Master-difficulty filter (slopsmith#48): when the source had
+        // phrase-level ladder data, render from the mastery-filtered
+        // array. _filteredNotes stays null for slider-disabled sources
+        // so rendering falls through to the flat notes array unchanged.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
         // Binary search for visible range
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearch(notes, tMin);
-        let hi = bsearch(notes, tMax);
+        let lo = bsearch(src, tMin);
+        let hi = bsearch(src, tMax);
 
         // Include sustained notes
-        while (lo > 0 && notes[lo-1].t + notes[lo-1].sus > currentTime) lo--;
+        while (lo > 0 && src[lo-1].t + src[lo-1].sus > currentTime) lo--;
 
         // Collect drawn positions for unison bend detection
         const drawnNotes = [];
 
         for (let i = hi - 1; i >= lo; i--) {
-            const n = notes[i];
+            const n = src[i];
             let tOff = n.t - currentTime;
 
             // Hold sustained notes at now line
@@ -594,13 +948,16 @@ function createHighway() {
     }
 
     function drawChords(W, H) {
+        // See drawNotes — _filteredChords is null for slider-disabled
+        // sources so we fall through to the flat chords array.
+        const src = _filteredChords !== null ? _filteredChords : chords;
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearchChords(chords, tMin);
-        let hi = bsearchChords(chords, tMax);
+        let lo = bsearchChords(src, tMin);
+        let hi = bsearchChords(src, tMax);
 
         for (let i = hi - 1; i >= lo; i--) {
-            const ch = chords[i];
+            const ch = src[i];
             const p = project(ch.t - currentTime);
             if (!p) continue;
 
@@ -725,67 +1082,114 @@ function createHighway() {
         const fontSize = Math.max(18, H * 0.028) | 0;
         const lineY = H * 0.04;
 
-        // Find phrases: groups of words separated by gaps > 2s or "+" endings
-        // Pre-build phrases once (cache)
-        if (!lyrics._phrases) {
-            lyrics._phrases = [];
-            let phrase = [];
+        // Rocksmith vocal markers: a trailing "-" means the syllable joins the
+        // next one into a single word (no space); a trailing "+" marks the end
+        // of an authored line. Build a flat list of authored lines so we can
+        // cap rendering to a 2-line rolling window (current + upcoming).
+        if (!lyrics._lines) {
+            const lines = [];
+            let line = null, word = null;
+
+            const flushWord = () => {
+                if (word && word.length) line.words.push(word);
+                word = null;
+            };
+            const flushLine = () => {
+                flushWord();
+                if (line && line.words.length) lines.push(line);
+                line = null;
+            };
+
             for (let i = 0; i < lyrics.length; i++) {
                 const l = lyrics[i];
-                if (phrase.length > 0) {
-                    const prev = phrase[phrase.length - 1];
-                    const gap = l.t - (prev.t + prev.d);
-                    if (gap > 2.0) {
-                        lyrics._phrases.push(phrase);
-                        phrase = [];
-                    }
+                const raw = l.w || '';
+                const endsLine = raw.endsWith('+');
+                const continuesWord = raw.endsWith('-');
+
+                // Safety fallback: if a song has no "+" markers at all, force a
+                // line break on any gap > 4s so we never build a single giant line.
+                if (line && i > 0) {
+                    const prev = lyrics[i - 1];
+                    if (l.t - (prev.t + prev.d) > 4.0) flushLine();
                 }
-                phrase.push(l);
+
+                if (!line) line = { words: [], start: l.t, end: l.t + l.d };
+                if (!word) word = [];
+
+                word.push(l);
+                line.end = Math.max(line.end, l.t + l.d);
+
+                if (!continuesWord) flushWord();
+                if (endsLine) flushLine();
             }
-            if (phrase.length) lyrics._phrases.push(phrase);
+            flushLine();
+
+            lyrics._lines = lines;
         }
 
-        // Find the current phrase
-        let currentPhrase = null;
-        for (const p of lyrics._phrases) {
-            const start = p[0].t;
-            const end = p[p.length - 1].t + p[p.length - 1].d;
-            if (currentTime >= start - 0.5 && currentTime <= end + 1.0) {
-                currentPhrase = p;
-                break;
-            }
+        const allLines = lyrics._lines;
+        if (!allLines.length) return;
+
+        // Current line = most recently started line. Before the first line has
+        // started, preview the first line if it's within 2s of starting.
+        let currentIdx = -1;
+        for (let i = 0; i < allLines.length; i++) {
+            if (allLines[i].start <= currentTime) currentIdx = i;
+            else break;
+        }
+        if (currentIdx === -1) {
+            if (allLines[0].start - currentTime > 2.0) return;
+            currentIdx = 0;
         }
 
-        if (!currentPhrase) return;
+        const currentLine = allLines[currentIdx];
+        const nextLine = allLines[currentIdx + 1] || null;
+        const gapToNext = nextLine ? (nextLine.start - currentLine.end) : Infinity;
 
-        // Split phrase into rows that fit within maxWidth
-        const maxWidth = W * 0.8;
+        // Hide once the current line is clearly over and nothing relevant follows.
+        if (currentTime > currentLine.end + 0.5 && gapToNext > 3.0) return;
+
+        const linesToShow = [currentLine];
+        if (nextLine && gapToNext <= 3.0) linesToShow.push(nextLine);
+
+        const sylText = (s) => {
+            const t = s.w || '';
+            return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t;
+        };
+
         ctx.font = `bold ${fontSize}px sans-serif`;
+        const spaceWidth = ctx.measureText(' ').width;
+        const maxWidth = W * 0.8;
 
+        // Respect authored line breaks; wrap only if a line overflows maxWidth.
         const rows = [];
-        let currentRow = [];
-        let currentRowWidth = 0;
-
-        for (let i = 0; i < currentPhrase.length; i++) {
-            const word = currentPhrase[i].w.replace(/\+$/, '') + ' ';
-            const wordWidth = ctx.measureText(word).width;
-
-            if (currentRow.length > 0 && currentRowWidth + wordWidth > maxWidth) {
-                rows.push(currentRow);
-                currentRow = [];
-                currentRowWidth = 0;
+        for (const authoredLine of linesToShow) {
+            let row = [], rowWidth = 0;
+            for (const wordSyls of authoredLine.words) {
+                const parts = [];
+                let wordWidth = 0;
+                for (const s of wordSyls) {
+                    const text = sylText(s);
+                    const w = ctx.measureText(text).width;
+                    parts.push({ syl: s, text, width: w });
+                    wordWidth += w;
+                }
+                const advance = wordWidth + spaceWidth;
+                if (row.length > 0 && rowWidth + advance > maxWidth) {
+                    rows.push(row);
+                    row = []; rowWidth = 0;
+                }
+                row.push({ parts, advance });
+                rowWidth += advance;
             }
-            currentRow.push({ lyric: currentPhrase[i], text: word, width: wordWidth });
-            currentRowWidth += wordWidth;
+            if (row.length) rows.push(row);
         }
-        if (currentRow.length) rows.push(currentRow);
 
-        // Draw background
         const rowHeight = fontSize + 6;
         const totalHeight = rows.length * rowHeight + 10;
         let bgWidth = 0;
         for (const row of rows) {
-            const rw = row.reduce((s, w) => s + w.width, 0);
+            const rw = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
             if (rw > bgWidth) bgWidth = rw;
         }
         bgWidth = Math.min(bgWidth + 30, W * 0.85);
@@ -794,34 +1198,36 @@ function createHighway() {
         roundRect(ctx, W/2 - bgWidth/2, lineY - 4, bgWidth, totalHeight, 8);
         ctx.fill();
 
-        // Draw each row
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
 
         for (let r = 0; r < rows.length; r++) {
             const row = rows[r];
-            const rowWidth = row.reduce((s, w) => s + w.width, 0);
+            const rowWidth = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
             let xPos = W/2 - rowWidth/2;
             const yPos = lineY + r * rowHeight + 2;
 
             for (const w of row) {
-                const l = w.lyric;
-                const isActive = currentTime >= l.t && currentTime < l.t + l.d;
-                const isPast = currentTime >= l.t + l.d;
+                for (const part of w.parts) {
+                    const l = part.syl;
+                    const isActive = currentTime >= l.t && currentTime < l.t + l.d;
+                    const isPast = currentTime >= l.t + l.d;
 
-                if (isActive) {
-                    ctx.fillStyle = '#4ae0ff';
-                    ctx.font = `bold ${fontSize}px sans-serif`;
-                } else if (isPast) {
-                    ctx.fillStyle = '#8899aa';
-                    ctx.font = `normal ${fontSize}px sans-serif`;
-                } else {
-                    ctx.fillStyle = '#556677';
-                    ctx.font = `normal ${fontSize}px sans-serif`;
+                    if (isActive) {
+                        ctx.fillStyle = '#4ae0ff';
+                        ctx.font = `bold ${fontSize}px sans-serif`;
+                    } else if (isPast) {
+                        ctx.fillStyle = '#8899aa';
+                        ctx.font = `normal ${fontSize}px sans-serif`;
+                    } else {
+                        ctx.fillStyle = '#556677';
+                        ctx.font = `normal ${fontSize}px sans-serif`;
+                    }
+
+                    ctx.fillText(part.text, xPos, yPos);
+                    xPos += part.width;
                 }
-
-                ctx.fillText(w.text, xPos, yPos);
-                xPos += w.width;
+                xPos += spaceWidth;
             }
         }
     }
@@ -859,27 +1265,125 @@ function createHighway() {
         return lo;
     }
 
+    // Rebuild the mastery-filtered note/chord arrays from _phrases +
+    // _mastery. Called on `ready` and on every setMastery(). When
+    // _phrases is null (slider-disabled source), we clear the filtered
+    // arrays — drawNotes/drawChords fall through to the flat arrays.
+    //
+    // Output arrays are pre-sorted by time because phrase iterations
+    // arrive in chronological order and within each level the notes/
+    // chords are time-sorted already (PR 1's parser sorts them), so
+    // concatenation preserves the order. No explicit sort needed.
+    function _rebuildMasteryFilter() {
+        // Null OR empty → fall through to flat arrays. The server's
+        // chunked emission invariant means _phrases should never land
+        // at `[]` in practice (it'd require the `phrases` message to
+        // fire with zero data), but the defensive guard means a bug
+        // on the way in wouldn't blank the chart.
+        if (_phrases === null || _phrases.length === 0) {
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
+            return;
+        }
+        const outNotes = [];
+        const outChords = [];
+        const outAnchors = [];
+        for (const p of _phrases) {
+            const n = p.levels.length;
+            if (n === 0) continue;
+            // Map slider fraction to a level index. `n` already equals
+            // `max_difficulty + 1` for fully-authored phrases, and
+            // equals the authored-level count otherwise — so indexing
+            // into p.levels.length is both correct and defensive.
+            const idx = Math.min(n - 1, Math.floor(_mastery * n));
+            const lv = p.levels[idx];
+            for (const x of lv.notes)   outNotes.push(x);
+            for (const x of lv.chords)  outChords.push(x);
+            // Anchors drive the fret zoom / pan. Keeping max-mastery
+            // anchors while hiding higher-difficulty notes would leave
+            // the highway panning into empty regions — filter them to
+            // the same level as the notes they pair with.
+            for (const x of lv.anchors) outAnchors.push(x);
+        }
+        _filteredNotes = outNotes;
+        _filteredChords = outChords;
+        _filteredAnchors = outAnchors;
+    }
+
     // ── Public API ───────────────────────────────────────────────────────
-    return {
-        init(canvasEl) {
+    const api = {
+        init(canvasEl, container) {
             canvas = canvasEl;
-            ctx = canvas.getContext('2d');
+            _resizeContainer = container || null;
+            // Size the canvas BEFORE installing the renderer so
+            // _setRenderer's init/resize calls see the real dimensions
+            // instead of the default 300x150 backing store. Otherwise
+            // WebGL renderers would allocate framebuffers at the wrong
+            // size and immediately have to tear them down when
+            // api.resize fires afterwards.
             this.resize();
-            window.addEventListener('resize', () => this.resize());
+            // Install the default renderer on first init. If a caller
+            // pre-selected a custom renderer before init ran (e.g.
+            // app.js restoring a saved viz picker selection at page
+            // load), re-apply that choice now that the canvas is
+            // available instead of clobbering it with the default.
+            // _setRenderer(_renderer) is correct: it re-applies the
+            // selected renderer now that the canvas exists, and only
+            // destroys the previous renderer if it had been
+            // successfully init'd before this mount (so a pre-selected
+            // renderer that never saw a canvas gets init'd fresh, not
+            // destroy+init'd).
+            _setRenderer(_renderer || _defaultRenderer);
+            if (_resizeHandler) window.removeEventListener('resize', _resizeHandler);
+            _resizeHandler = () => this.resize();
+            window.addEventListener('resize', _resizeHandler);
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
         },
 
         resize() {
             if (!canvas) return;
-            const controls = document.getElementById('player-controls');
-            const controlsH = controls ? controls.offsetHeight : 50;
-            const w = document.documentElement.clientWidth;
-            const h = document.documentElement.clientHeight - controlsH;
+            let w, h;
+            if (_resizeContainer) {
+                const rect = _resizeContainer.getBoundingClientRect();
+                w = rect.width;
+                h = rect.height;
+            } else {
+                const controls = document.getElementById('player-controls');
+                const controlsH = controls ? controls.offsetHeight : 50;
+                w = document.documentElement.clientWidth;
+                h = document.documentElement.clientHeight - controlsH;
+            }
             canvas.style.width = w + 'px';
             canvas.style.height = h + 'px';
             canvas.width = Math.round(w * _renderScale);
             canvas.height = Math.round(h * _renderScale);
+            // Notify the active renderer so WebGL / offscreen buffers
+            // can recreate their framebuffers. Setting canvas.width
+            // above already invalidates both 2D and WebGL state — any
+            // renderer relying on persistent GPU resources listens here.
+            //
+            // Gated on _rendererInited: a renderer pre-selected via
+            // setRenderer before api.init has run is stashed but not
+            // initialized yet. Calling resize() on it would violate
+            // the init-before-resize contract and can break renderers
+            // that assume resize() means "canvas dims changed after
+            // setup." The subsequent api.init will call its resize()
+            // once init succeeds.
+            if (_renderer && _rendererInited && typeof _renderer.resize === 'function') {
+                try { _renderer.resize(canvas.width, canvas.height); }
+                catch (e) { console.error('renderer resize:', e); }
+            }
         },
 
         setRenderScale(scale) {
@@ -899,7 +1403,30 @@ function createHighway() {
 
         getLefty() { return _lefty; },
 
-        connect(wsUrl) {
+        // Master-difficulty (slopsmith#48). Per-instance: splitscreen
+        // plugins that call createHighway() separately get their own
+        // _mastery via closure.
+        setMastery(fraction) {
+            // Same NaN guard as the init (plugins could pass undefined
+            // or a string that coerces badly). Silently ignore — the
+            // caller probably meant to pass a number; keeping the
+            // previous value is safer than propagating NaN into
+            // Math.floor → p.levels[NaN].
+            const next = Number(fraction);
+            if (!Number.isFinite(next)) return;
+            _mastery = Math.max(0, Math.min(1, next));
+            _rebuildMasteryFilter();
+        },
+        getMastery() { return _mastery; },
+        // Align with _rebuildMasteryFilter's own "null OR empty → fall
+        // through" check. If we returned true for _phrases = [], the
+        // slider would be enabled (via song:ready's hasPhraseData) but
+        // dragging it would do nothing (filter stays null). Same
+        // sentinel, same check, single source of truth.
+        hasPhraseData() { return !!(_phrases && _phrases.length > 0); },
+
+        connect(wsUrl, opts = {}) {
+            _connectOpts = opts;
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
@@ -907,7 +1434,8 @@ function createHighway() {
                 const msg = JSON.parse(ev.data);
                 if (msg.error) {
                     console.error('Server error:', msg.error);
-                    alert('Error: ' + msg.error);
+                    if (opts.onError) opts.onError(msg.error);
+                    else alert('Error: ' + msg.error);
                     return;
                 }
                 switch (msg.type) {
@@ -916,68 +1444,116 @@ function createHighway() {
                         break;
                     case 'song_info':
                         songInfo = msg;
-                        document.getElementById('hud-artist').textContent = msg.artist;
-                        document.getElementById('hud-title').textContent = msg.title;
-                        document.getElementById('hud-arrangement').textContent = msg.arrangement;
-                        if (msg.audio_url) {
-                            const audio = document.getElementById('audio');
-                            if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
-                                audio.src = msg.audio_url;
-                                audio.load();
+                        if (opts.onSongInfo) {
+                            opts.onSongInfo(msg);
+                        } else {
+                            document.getElementById('hud-artist').textContent = msg.artist;
+                            document.getElementById('hud-title').textContent = msg.title;
+                            document.getElementById('hud-arrangement').textContent = msg.arrangement;
 
-                                // Show buffering overlay
-                                let overlay = document.getElementById('audio-buffer-overlay');
-                                if (!overlay) {
-                                    overlay = document.createElement('div');
-                                    overlay.id = 'audio-buffer-overlay';
-                                    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
-                                    overlay.innerHTML = `
-                                        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
-                                            <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
-                                            <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
-                                                <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
-                                            </div>
-                                            <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
-                                        </div>`;
-                                    document.body.appendChild(overlay);
-                                }
+                            // Clear any lingering audio-error banner from a prior song.
+                            const existingAudioErr = document.getElementById('audio-error-banner');
+                            if (existingAudioErr) existingAudioErr.remove();
 
-                                const bar = document.getElementById('audio-buffer-bar');
-                                const pct = document.getElementById('audio-buffer-pct');
+                            // Server reported a concrete audio-pipeline failure and has
+                            // no URL to give us — surface it instead of leaving the
+                            // user with a cryptic "Empty src attribute" from audio.play().
+                            if (!msg.audio_url && msg.audio_error) {
+                                const banner = document.createElement('div');
+                                banner.id = 'audio-error-banner';
+                                banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
+                                banner.innerHTML = `
+                                    <div class="flex items-start gap-3">
+                                        <span class="text-xl leading-none">⚠</span>
+                                        <div class="flex-1">
+                                            <div class="font-semibold text-sm">Audio unavailable</div>
+                                            <div class="text-xs text-red-200 mt-1"></div>
+                                        </div>
+                                        <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
+                                    </div>`;
+                                banner.querySelector('.text-xs').textContent = msg.audio_error;
+                                banner.querySelector('button').addEventListener('click', () => banner.remove());
+                                document.body.appendChild(banner);
+                            }
 
-                                const MIN_BUFFER_SECS = 30;
+                            if (msg.audio_url) {
+                                const audio = document.getElementById('audio');
+                                if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
+                                    audio.src = msg.audio_url;
+                                    audio.load();
 
-                                function onProgress() {
-                                    if (audio.buffered.length > 0 && audio.duration > 0) {
-                                        const loaded = audio.buffered.end(audio.buffered.length - 1);
-                                        const p = Math.round((loaded / audio.duration) * 100);
-                                        if (bar) bar.style.width = p + '%';
-                                        if (pct) pct.textContent = p + '%';
-                                        // Dismiss when enough is buffered
-                                        if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
-                                            cleanup();
+                                    // Show buffering overlay
+                                    let overlay = document.getElementById('audio-buffer-overlay');
+                                    if (!overlay) {
+                                        overlay = document.createElement('div');
+                                        overlay.id = 'audio-buffer-overlay';
+                                        overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+                                        overlay.innerHTML = `
+                                            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
+                                                <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
+                                                <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
+                                                    <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
+                                                </div>
+                                                <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
+                                            </div>`;
+                                        document.body.appendChild(overlay);
+                                    }
+
+                                    const bar = document.getElementById('audio-buffer-bar');
+                                    const pct = document.getElementById('audio-buffer-pct');
+
+                                    const MIN_BUFFER_SECS = 30;
+
+                                    function onProgress() {
+                                        if (audio.buffered.length > 0 && audio.duration > 0) {
+                                            const loaded = audio.buffered.end(audio.buffered.length - 1);
+                                            const p = Math.round((loaded / audio.duration) * 100);
+                                            if (bar) bar.style.width = p + '%';
+                                            if (pct) pct.textContent = p + '%';
+                                            // Dismiss when enough is buffered
+                                            if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
+                                                cleanup();
+                                            }
                                         }
                                     }
-                                }
 
-                                function cleanup() {
-                                    audio.removeEventListener('progress', onProgress);
-                                    audio.removeEventListener('canplaythrough', cleanup);
-                                    const ol = document.getElementById('audio-buffer-overlay');
-                                    if (ol) ol.remove();
-                                }
+                                    function cleanup() {
+                                        audio.removeEventListener('progress', onProgress);
+                                        audio.removeEventListener('canplaythrough', cleanup);
+                                        const ol = document.getElementById('audio-buffer-overlay');
+                                        if (ol) ol.remove();
+                                    }
 
-                                audio.addEventListener('progress', onProgress);
-                                // Fallback: also dismiss on canplaythrough
-                                audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                    audio.addEventListener('progress', onProgress);
+                                    // Fallback: also dismiss on canplaythrough
+                                    audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                }
+                            }
+                            // Populate arrangement dropdown
+                            if (msg.arrangements) {
+                                const sel = document.getElementById('arr-select');
+                                sel.innerHTML = msg.arrangements.map(a =>
+                                    `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
+                                ).join('');
                             }
                         }
-                        // Populate arrangement dropdown
-                        if (msg.arrangements) {
-                            const sel = document.getElementById('arr-select');
-                            sel.innerHTML = msg.arrangements.map(a =>
-                                `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
-                            ).join('');
+                        // Plugin context API — broadcast current song state
+                        if (window.slopsmith) {
+                            const wsPath = ws.url.split('/ws/highway/')[1] || '';
+                            const filename = decodeURIComponent(wsPath.split('?')[0]);
+                            window.slopsmith.currentSong = {
+                                filename,
+                                title: msg.title,
+                                artist: msg.artist,
+                                duration: msg.duration,
+                                arrangement: msg.arrangement,
+                                arrangementIndex: msg.arrangement_index,
+                                arrangements: msg.arrangements || [],
+                                tuning: msg.tuning,
+                                capo: msg.capo,
+                                format: msg.format,
+                            };
+                            window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                         }
                         break;
                     case 'beats': beats = msg.data; break;
@@ -993,11 +1569,34 @@ function createHighway() {
                     case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
                     case 'notes': notes = notes.concat(msg.data); break;
                     case 'chords': chords = chords.concat(msg.data); break;
+                    case 'phrases':
+                        // Accumulate chunks but DON'T rebuild the filter
+                        // until `ready` — rebuilding per chunk would
+                        // cause visual flicker (partial filtered array
+                        // visible while later chunks are still arriving)
+                        // and duplicate work.
+                        if (_phrases === null) _phrases = [];
+                        for (const p of msg.data) _phrases.push(p);
+                        break;
                     case 'ready':
                         ready = true;
-                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
+                        _rebuildMasteryFilter();
+                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
+                            (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
                         if (!animFrame) draw();
-                        if (highway._onReady) highway._onReady();
+                        if (api._onReady) api._onReady();
+                        // Broadcast to interested listeners (e.g. the
+                        // difficulty-slider disabled-state update in
+                        // app.js). Fires on every `ready`, including
+                        // arrangement switches — unlike `_onReady`,
+                        // which is a single-use callback slot.
+                        if (window.slopsmith) {
+                            // Reuse api.hasPhraseData so the emit and
+                            // the public getter agree on the sentinel.
+                            window.slopsmith.emit('song:ready', {
+                                hasPhraseData: api.hasPhraseData(),
+                            });
+                        }
                         break;
                 }
             };
@@ -1032,6 +1631,7 @@ function createHighway() {
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
         addDrawHook(fn) { _drawHooks.push(fn); },
+        removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
         project(tOffset) { return project(tOffset); },
         fretX(fret, scale, w) { return fretX(fret, scale, w); },
 
@@ -1040,42 +1640,84 @@ function createHighway() {
 
         toggleLyrics() {
             showLyrics = !showLyrics;
-            const btn = document.getElementById('btn-lyrics');
-            if (btn) {
-                btn.textContent = showLyrics ? 'Lyrics ✓' : 'Lyrics ✗';
-                btn.className = showLyrics
-                    ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
-                    : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
-            }
+            localStorage.setItem('showLyrics', String(showLyrics));
+            if (_onLyricsChange) _onLyricsChange(showLyrics);
         },
 
         getLyricsVisible() { return showLyrics; },
-        setLyricsVisible(v) { showLyrics = !!v; },
+        setLyricsVisible(v) {
+            showLyrics = !!v;
+            if (_onLyricsChange) _onLyricsChange(showLyrics);
+        },
+        setOnLyricsChange(fn) { _onLyricsChange = fn; },
 
         reconnect(filename, arrangement) {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
             const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decoded}${arrParam}`;
             console.log('reconnect:', wsUrl);
-            this.connect(wsUrl);
+            this.connect(wsUrl, _connectOpts);
         },
 
         stop() {
             if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
             if (ws) { ws.close(); ws = null; }
+            if (_resizeHandler) {
+                window.removeEventListener('resize', _resizeHandler);
+                _resizeHandler = null;
+            }
+            // Release the renderer's GPU / DOM / event-listener resources
+            // when leaving the player — anything it allocated in init()
+            // should be torn down here so navigating away doesn't leak.
+            // Crucially we KEEP `_renderer` (the instance/selection) so
+            // that the next api.init() can re-apply the same visualization
+            // on the new canvas. _rendererInited flips to false so
+            // _setRenderer knows not to call destroy() again on this
+            // already-destroyed instance.
+            _destroyCurrentIfInited();
             ready = false;
-            const audio = document.getElementById('audio');
-            audio.pause();
-            audio.src = '';
-            isPlaying = false;
-            document.getElementById('btn-play').textContent = '▶ Play';
         },
+
+        /**
+         * Install a custom renderer. Contract (slopsmith#36):
+         *   r.init(canvas, bundle) — one-time setup; owns getContext().
+         *   r.draw(bundle)         — per rAF frame.
+         *   r.resize(w, h)         — optional; called when canvas dims change.
+         *   r.destroy()            — optional; release resources.
+         * Pass null or undefined to restore the default renderer.
+         *
+         * Custom renderers receive a data bundle (see _makeBundle) that
+         * already applies the master-difficulty filter — the notes /
+         * chords / anchors arrays are the right set to render regardless
+         * of slider position. Use _drawHooks only for the default
+         * renderer; they're a 2D-only contract.
+         */
+        setRenderer(r) { _setRenderer(r); },
     };
+    return api;
 }
 const highway = createHighway();
 window.highway = highway; // expose for plugins
+highway.setOnLyricsChange(function(visible) {
+    const btn = document.getElementById('btn-lyrics');
+    if (btn) {
+        btn.textContent = visible ? 'Lyrics \u2713' : 'Lyrics \u2717';
+        btn.className = visible
+            ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
+            : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+    }
+});

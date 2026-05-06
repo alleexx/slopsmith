@@ -226,7 +226,12 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Stems Mixer](https://github.com/topkoa/slopsmith-plugin-stems) | Per-stem mute/volume controls for .sloppak songs | `git clone ...slopsmith-plugin-stems.git stems` |
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
 | [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab) | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab` |
+| [Step Mode](https://github.com/byrongamatos/slopsmith-plugin-stepmode) | Rocksmith-1-style practice mode — highway freezes at each note until played (via Note Detection) or Space | `git clone ...slopsmith-plugin-stepmode.git step_mode` |
 | [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync) | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync` |
+| [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone) | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone` |
+| [Guitar Theory Lab](https://github.com/topkoa/slopsmith-plugin-guitar-theory) | Explore scales, chords, intervals, tunings, and voicings on a fully interactive fretboard  | `git clone ...slopsmith-plugin-nam-tone.git guitar-theory-lab` |
+| [Themes](https://github.com/masc0t/slopsmith-plugin-themes) | Offers several basic recolorings of the interface  | `git clone ...slopsmith-plugin-themes.git themes` |
+| [Update Manager](https://github.com/masc0t/slopsmith-update-manager) | Installs, updates, and uninstalls other plugins and the slopsmith core itself   | `git clone ...slopsmith-update-manager.git update_manager` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
@@ -236,6 +241,10 @@ git clone https://github.com/byrongamatos/slopsmith-plugin-ug.git ultimate_guita
 docker compose restart
 ```
 
+## AI Agent Guide
+
+This repo includes a [`CLAUDE.md`](CLAUDE.md) file with architecture overview, plugin conventions, and best practices for AI coding agents (Claude Code, etc.). If you're using AI tools to contribute, the guide is picked up automatically. If you're updating conventions or patterns, please keep `CLAUDE.md` in sync.
+
 ## Tech Stack
 
 - **Backend**: Python / FastAPI / SQLite / WebSocket
@@ -244,6 +253,17 @@ docker compose restart
 - **SNG Compiler**: F# CLI tool wrapping [Rocksmith2014.NET](https://github.com/iminashi/Rocksmith2014.NET)
 - **Audio**: vgmstream (WEM decode) / FFmpeg / FluidSynth (MIDI render) / rubberband (pitch shift)
 - **Docker**: Self-contained image with all dependencies
+
+## Running tests
+
+Core library modules have a small pytest suite (pure functions only — no fixtures, no Docker). To run it locally:
+
+```bash
+pip install -r requirements.txt -r requirements-test.txt
+pytest
+```
+
+CI runs the same suite on every push and PR against `main` (see `.github/workflows/tests.yml`). Contributions adding tests are welcome — the current targets are `lib/tunings.py` and `lib/song.py`; natural follow-ups would be the pure helpers in `lib/sloppak_convert.py` and the tempo/tick math in `lib/gp2rs.py`.
 
 ## License
 

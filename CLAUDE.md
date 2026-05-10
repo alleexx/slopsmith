@@ -42,7 +42,14 @@ Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` 
   "screen": "screen.html",
   "script": "screen.js",
   "routes": "routes.py",
-  "settings": { "html": "settings.html" }
+  "settings": {
+    "html": "settings.html",
+    "server_files": ["my_plugin.db", "my_plugin_models/"]
+  },
+  "diagnostics": {
+    "server_files": ["my_plugin.diag.json"],
+    "callable": "diagnostics:collect"
+  }
 }
 ```
 
@@ -50,8 +57,26 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 
 `version` and `private` are advisory metadata — the plugin loader does not currently consume them, but plugins commonly include them for publishing/tooling purposes.
 
+`settings.server_files` is the **opt-in** for the unified Settings export/import flow (slopsmith#113). It's a list of relpaths under `context["config_dir"]` that the plugin wants included in user-triggered backups. A trailing `/` denotes a directory (recurse). Plugins that omit this field have no server-side files exported; their state lives entirely in browser `localStorage`, which is bundled wholesale on every export. Rules:
+- Relpaths only. Absolute paths, drive letters, `..` segments, and backslashes are rejected at load time with a `[Plugin]` warning.
+- The same allowlist is consulted at both export and import: a bundle that references a file the *importing host*'s manifest no longer declares is skipped with a warning (handles plugin updates between export and import). A bundle that references a file your host's manifest never declared is also skipped — no surprise writes.
+- Files are encoded as `{"encoding": "json", "data": <parsed>}` for `.json` files that parse cleanly (diff-friendly), `{"encoding": "base64", "data": "..."}` otherwise (sqlite, model blobs, IRs).
+- Plugins own their internal data migration. Importing a bundle whose data schema predates your current code restores bytes verbatim — your plugin must cope at next load.
+- Symlinks are skipped on export and never followed on import.
+
+`diagnostics` is the **opt-in** for the troubleshooting bundle (slopsmith#166 — Settings → Export Diagnostics). Two independent fields:
+- `diagnostics.server_files` — same allowlist semantics as `settings.server_files`: relpaths under `context["config_dir"]`, no `..`, no abs paths, no backslashes, no leading dots. Files listed here are copied verbatim into `plugins/<plugin_id>/<relpath>` inside the bundle. Use this for snapshot-style state (small DB excerpts, model lists, last-error files).
+- `diagnostics.callable` — `"<module>:<function>"` (e.g. `"diagnostics:collect"`). Resolved lazily via `load_sibling` when the user clicks Export, then called as `func({"plugin_id": "...", "config_dir": Path(...)})`. Return `dict`/`list` → written to `plugins/<id>/callable.json`; `bytes` → `callable.bin`; `str` → `callable.txt`. Exceptions are caught and appended to the bundle's `manifest.notes` — a buggy plugin never crashes the export.
+
+Plugins that omit the field contribute nothing to the bundle from the backend side. Frontend plugins can independently push state via `window.slopsmith.diagnostics.contribute(plugin_id, payload)` from their `screen.js` before the user hits Export. Bundle layout + per-file schemas: [docs/diagnostics-bundle-spec.md](docs/diagnostics-bundle-spec.md).
+
+Best practices:
+- Embed your own `schema` field (e.g. `"my_plugin.diag.v1"`) in JSON returned by `callable` so future tooling can dispatch by version.
+- Keep payloads small (< 100 KB). Diagnostics are not a backup channel — that's `settings.server_files`.
+- Don't include user secrets, API keys, or session tokens. The bundle is shared with maintainers / posted to GitHub issues.
+
 `type` is an optional role hint (slopsmith#36). Supported values:
-- `"visualization"` — plugin provides a highway renderer. Declaring this makes the plugin eligible for the main-player viz picker (and, once Wave C lands, splitscreen's per-panel picker too). Must pair with a `window.slopsmithViz_<id>` factory exporting the setRenderer contract below.
+- `"visualization"` — plugin provides a highway renderer. Declaring this makes the plugin eligible for the main-player viz picker AND splitscreen's per-panel picker. Must pair with a `window.slopsmithViz_<id>` factory exporting the setRenderer contract below.
 - Absent → no declared role; plugin is loaded and its script runs, but it doesn't appear in role-specific UIs.
 
 **Backend routes** — `routes.py` must export a `setup(app, context)` function. The `context` dict provides:
@@ -60,6 +85,27 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 - `extract_meta()` — metadata extraction callable
 - `meta_db` — shared MetadataDB instance
 - `get_sloppak_cache_dir()` — sloppak cache path
+- `load_sibling(name)` — loads a sibling module from this plugin's directory under a unique, namespaced module name. See "Sibling imports" below.
+- `log` — stdlib `logging.Logger` namespaced to `slopsmith.plugin.<id>`. Pre-configured with the app-wide level, format (including JSON mode), and correlation IDs. Use this for all backend plugin output instead of `print()`. See "Backend plugin logging" below.
+
+**Sibling imports — use `load_sibling`, not bare imports** (slopsmith#33). The plugin loader inserts each plugin's directory onto `sys.path` so `from extractor import X` works, but Python caches imports by **module name** in `sys.modules`. Two plugins that each ship a top-level `extractor.py` (or any other generic name — `util.py`, `client.py`, `parser.py`, `config.py`, …) collide: whichever loads first wins, and the other plugin's `from extractor import X` either gets the wrong module or fails with `cannot import name 'X' from 'extractor'`.
+
+The fix is `context["load_sibling"](name)`, which loads the sibling under a namespaced module name (`plugin_<id>.<name>`, where plugin_id is bijectively encoded so reverse-DNS-style ids like `com.example.foo` work without colliding: `_` -> `_5f_`, `.` -> `_2e_`) so each plugin gets its own copy:
+
+```python
+def setup(app, context):
+    extractor = context["load_sibling"]("extractor")
+    PsarcReader = extractor.PsarcReader
+    # …
+```
+
+Notes:
+- `name` is a bare module name — no `.py` suffix, no slashes, no `.`. The helper raises `ValueError` for path traversal / format issues and `ImportError` for missing files.
+- Both single-file siblings (`extractor.py`) and package-form siblings (`extractor/__init__.py`) work. Package form wins when both exist (matches CPython's import-resolution precedence).
+- Relative imports between siblings work — `from .shared import X` in a top-level helper, `from ..shared import X` from inside a sibling package. The synthetic parent package `plugin_<id>` carries the plugin directory in its `__path__`.
+- `from . import sibling` (attribute-style) also resolves: loaded children are exposed as attributes on the parent package.
+- Repeat calls return the cached module. Concurrent first-time calls are serialized via per-module locks so no caller observes a half-initialized module.
+- Bare `import sibling` from `routes.py` still works during the transition period, but the loader prints a startup warning when it detects two plugins shipping a same-named top-level module — covering both `.py` files and package directories. Migrate to `load_sibling` to silence the warning and immunize your plugin from future ecosystem collisions. (Don't mix bare imports and `load_sibling` for the same module — they'd execute the file twice and split module-level state.)
 
 **Frontend scripts** — `screen.js` runs in the global scope via a `<script>` tag. It can access `window.playSong`, `window.showScreen`, `window.createHighway`, the `<audio>` element, and the `window.slopsmith` event emitter.
 
@@ -67,14 +113,13 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 
 ## Plugin Best Practices
 
-### Visualization plugins — three complementary contracts
+### Visualization plugins — two complementary contracts
 
-Slopsmith supports three ways for a plugin to participate in the main player's visuals. They coexist; new plugins should prefer the setRenderer contract where it fits.
+Slopsmith supports two ways for a plugin to participate in the main player's visuals. They coexist; the setRenderer contract is the default for any viz that draws a highway-shaped surface, and overlays handle layered decorations on top.
 
 **Pick the right shape:**
-- Replacing the whole highway drawing? → **setRenderer** (section 1). Enters the viz picker.
+- Replacing the whole highway drawing on the existing highway canvas (your renderer owns its rendering context / resources; `createHighway()` still owns the canvas element and the rAF loop)? → **setRenderer** (section 1). Enters the viz picker. Works in both the main player and per-panel under splitscreen.
 - Adding a layer on top of whichever viz is active? → **Overlay** (section 2). Navbar toggle, not in the picker.
-- Spawning a fully standalone pane (own WebSocket, independent lifecycle)? → **Standalone pane** (section 3). Used by splitscreen today.
 
 #### 1. setRenderer contract (slopsmith#36) — preferred
 
@@ -92,14 +137,17 @@ window.slopsmithViz_my_viz = function () {
             // Called each requestAnimationFrame tick by the factory.
             // `bundle` is a snapshot with: currentTime, songInfo, isReady,
             // notes, chords, anchors (all difficulty-filter-aware),
-            // beats, sections, chordTemplates, lyrics, toneChanges,
-            // toneBase, mastery, hasPhraseData, inverted, lefty,
-            // renderScale, lyricsVisible, plus the 2D coordinate
-            // helpers project and fretX. If your renderer needs
-            // lefty-aware text rendering, check bundle.lefty and
-            // apply the mirror transform yourself — a bundle-level
-            // helper isn't provided because it would need your
-            // renderer's own context, not the factory's.
+            // beats, sections, chordTemplates, stringCount, lyrics,
+            // toneChanges, toneBase, mastery, hasPhraseData, inverted,
+            // lefty, renderScale, lyricsVisible, plus the 2D coordinate
+            // helpers project and fretX. `stringCount` is the active
+            // arrangement's string count (4 for bass, 6 for guitar,
+            // 7+ for extended-range GP imports — size string-indexed
+            // geometry against this, not a hardcoded 6). If your
+            // renderer needs lefty-aware text rendering, check
+            // bundle.lefty and apply the mirror transform yourself —
+            // a bundle-level helper isn't provided because it would
+            // need your renderer's own context, not the factory's.
         },
         resize(w, h) {
             // Optional. Canvas dims already updated; re-create WebGL
@@ -114,7 +162,7 @@ window.slopsmithViz_my_viz = function () {
 };
 ```
 
-Selecting this plugin in the main-player viz picker (or, after Wave C, in splitscreen's per-panel picker) calls `highway.setRenderer(factory())` on the existing highway instance. The built-in 2D highway is the default renderer and is restored by `setRenderer(null)`.
+Selecting this plugin in the main-player viz picker — or in splitscreen's per-panel picker — calls `highway.setRenderer(factory())` on the existing highway instance. The built-in 2D highway is the default renderer and is restored by passing nullish — `setRenderer(null)` and `setRenderer(undefined)` both work (the implementation gates on `r == null`). Splitscreen panels create one `createHighway()` per panel and each independently consults the picker, so N panels can run different renderers (or N copies of the same renderer with different arrangements) without coordination.
 
 **Lifecycle contract.** The factory returns a single renderer instance that may go through multiple `init() → ... → destroy()` cycles as the user navigates between songs or screens. Specifically:
 
@@ -133,7 +181,7 @@ Selecting this plugin in the main-player viz picker (or, after Wave C, in splits
   - But if the default renderer already owns the canvas (the usual case — user picks WebGL from the dropdown mid-session), switching to WebGL on that same canvas fails. The reverse fails too: a canvas that started with a WebGL renderer can't switch back to the default 2D.
   Supporting arbitrary swaps between 2D and WebGL therefore requires recreating or replacing the canvas element when the context type changes — out of scope for Wave A, but the restore-at-load path is a viable escape hatch for WebGL viz authors today.
 - `draw(bundle)` receives difficulty-filtered arrays — never read from `_filteredNotes` or other internals.
-- `_drawHooks` fire only for the default 2D renderer. Custom renderers handling their own compositing should not expect them.
+- `_drawHooks` fire for the default 2D renderer (the factory calls them at the end of each frame). Custom WebGL renderers that maintain a 2D overlay canvas (like the bundled 3D highway) also call `window.highway.fireDrawHooks(ctx, W, H)` on that overlay so overlay plugins continue to work regardless of which renderer is active. Custom renderers without a 2D overlay context should not attempt to fire hooks.
 
 **Auto mode — `matchesArrangement(songInfo)` (optional).**
 
@@ -162,50 +210,89 @@ Plugins that add a layer on top of whichever visualization is active — HUDs, f
 
 - `highway.getTime()` / `highway.getBeats()` — current playback position
 - `highway.getNotes()` / `highway.getChords()` — difficulty-filter-aware arrays
+- `highway.getChordTemplates()` — chord shape lookup table; index by `chord.id` from `getChords()` to get `{ name, fingers, frets }`. `fingers` and `frets` are per-string arrays (length matches the tuning's string count); within `fingers`, `-1` = unused, `0` = open string, `n > 0` = finger number. RS XML sources populate real fingerings; GP imports currently emit all `-1` since pre-import sources don't carry finger data. Not filter-aware: templates are static metadata, every `chord_id` referenced by `getChords()` is guaranteed valid
 - `highway.getSongInfo()` — tuning, arrangement, capo
+- `highway.getStringCount()` — number of strings on the active arrangement (4 for bass, 6 for guitar, 7+ for extended-range GP imports). Derived server-side as `max(notes-max-string + 1, name-based fallback, len(tuning))` where the tuning length only contributes when it isn't the RS-XML padded 6-string form (sloppak / GP-imported sources carry trimmed tuning lengths). The name-based fallback is 4 for arrangements containing "bass" (case-insensitive) and 6 otherwise. This combination handles partial-string-usage charts (a 6-string lead that never plays string 5), extended-range GP imports (5-string bass, 7-string guitar), and sloppaks that explicitly encode the instrument range — without requiring plugins to do their own arrangement-name matching
 - `highway.getLefty()` / `highway.getInverted()` — mirror + invert state
 
 Overlays do NOT appear in the viz picker and do NOT declare `"type": "visualization"` in `plugin.json`. They coexist with whichever renderer (default 2D, 3D highway, piano, ...) the user has picked.
 
 **Key rules:**
-- **Own your rAF + canvas** — don't piggyback on `_drawHooks` (those only fire for the default 2D renderer) or on `createHighway`'s rendering context.
+- **Own your rAF + canvas** — don't piggyback on `_drawHooks` or on `createHighway`'s rendering context. Draw hooks fire for the default 2D renderer and for custom renderers that explicitly call `window.highway.fireDrawHooks(ctx, W, H)` (e.g. the bundled 3D highway fires them on its 2D overlay canvas), but not for every custom renderer.
 - **Re-read state every frame** — overlay output must track whatever the current renderer is drawing. Don't cache note positions across frames.
 - **Respect lefty + invert toggles** — if the overlay depicts strings or frets, mirror using the same transforms the active renderer would.
 - **Clean up on toggle-off** — cancel rAF and remove/hide the overlay canvas so inactive overlays aren't wasting frames.
 
 Reference: [fretboard plugin](https://github.com/byrongamatos/slopsmith-plugin-fretboard) — canonical overlay implementation (navbar toggle, own canvas, 80ms active-note window).
 
-#### 3. Standalone pane contract — used by splitscreen today
+**Why two?** setRenderer plugs into an existing highway — main-player or splitscreen-panel — reusing its WebSocket and data parsing, so the common "I want a different look for the same data" case is zero boilerplate AND multi-instance for free. Overlays compose with whatever renderer is active — they decorate rather than replace, so multiple can stack (fretboard + chord labels + practice feedback) without fighting over the canvas.
 
-Plugins that want to be their own fully self-contained pane (own WebSocket, own canvas, own rAF loop) — the model splitscreen uses for Tab view and similar — export a factory on `window.createMyVisualization`:
+A previous standalone-pane contract (`window.createMyVisualization({ container })` with its own WebSocket per pane) was used by splitscreen pre-Wave-C. It's been retired now that splitscreen calls `setRenderer` on per-panel `createHighway()` instances; if you find references in older plugin docs or external integration guides, those describe the legacy path.
+
+### Audio mixer fader registration (slopsmith#87)
+
+Plugins that produce audio outside the song's `<audio>` element (NAM amp output, synth voices, etc.) can register a labeled fader so users can balance them against the song from one mixer popover in the player controls.
 
 ```js
-window.createMyVisualization = function ({ container }) {
-    // Create canvas/DOM inside container (split screen manages the container div)
-    // Each call creates an INDEPENDENT instance — no shared mutable state
-    return {
-        connect(filename, arrangementIndex) { /* open WebSocket, start rendering */ },
-        destroy() { /* cancel RAF, close WebSocket, remove DOM nodes */ },
-        resize()  { /* update canvas backing store to match container size */ },
-    };
-};
+function _registerFader() {
+    const api = window.slopsmith && window.slopsmith.audio;
+    if (!api) return;
+    api.registerFader({
+        id: 'my_plugin',           // unique key
+        label: 'My Plugin',        // shown above the fader
+        unit: 'dB',                // optional suffix shown next to the value (e.g. '%', 'dB')
+        min: 0, max: 2, step: 0.05,
+        defaultValue: 1.0,
+        getValue: () => _myCurrentVolume,        // read current value
+        setValue: (v) => _setMyVolume(v),         // write + persist + apply
+    });
+}
+
+if (window.slopsmith && window.slopsmith.audio) {
+    _registerFader();
+} else {
+    window.addEventListener('slopsmith:audio:ready', _registerFader, { once: true });
+}
 ```
 
-**Key rules:**
-- **No shared mutable state** — split screen creates 2-4 instances simultaneously. Each must have its own canvas, WebSocket, RAF handle, and internal state. Use closures or a context-swap pattern.
-- **Own your WebSocket** — open your own connection to `/ws/highway/{filename}?arrangement={index}`. Do not reuse the main highway's connection.
-- **Sync to audio directly** — read `document.getElementById('audio').currentTime` in your RAF loop.
-- **Clean up completely in `destroy()`** — cancel RAF, close WebSocket, remove DOM nodes you created.
-- **Handle `resize()` properly** — update canvas backing store respecting `devicePixelRatio`.
-- **Gate on factory existence** — split screen checks `typeof window.createMyVisualization === 'function'` at runtime. If your plugin isn't installed, the option simply doesn't appear.
+The plugin owns persistence — the registry calls `getValue()` when the popover opens, and also after each `setValue()` during slider drags to re-sync the displayed value. Keep `getValue()` cheap and side-effect-free, and make sure `setValue()` updates whatever backing state `getValue()` reads synchronously. Pair `setValue` with whatever your plugin already does internally (write the GainNode, persist to localStorage, update any in-plugin label). Use `unregisterFader(id)` when your plugin is teardown-able and you want the strip to disappear; otherwise keep it registered so the user's setting persists across toggle states.
 
-See the full integration guide: [Integrating Your Plugin With Split Screen](https://github.com/topkoa/slopsmith-plugin-splitscreen#integrating-your-plugin-with-split-screen)
+### Backend plugin logging
 
-Reference implementations:
-- **Lyrics pane** — `createLyricsPane()` in splitscreen's screen.js (DOM-based, simplest example)
-- **Jumping Tab** — `window.createJumpingTabPane()` in the [Jumping Tab plugin](https://github.com/renanboni/slopsmith-plugin-jumpingtab) (canvas-based with context-swap)
+Use `context["log"]` for all backend plugin output. It is a stdlib `logging.Logger` namespaced to `slopsmith.plugin.<id>`, pre-configured with the app-wide level, format (including JSON mode), and correlation IDs. Never use `print()` — it bypasses correlation context and log rotation.
 
-**Why three?** setRenderer plugs into an existing highway, reusing its WebSocket and data parsing — zero boilerplate for the common "I want a different look for the same data" case. Overlays compose with whatever renderer is active — they decorate rather than replace, so multiple can stack (fretboard + chord labels + practice feedback) without fighting over the canvas. The pane contract is for panels that need their own lifecycle (e.g. Tab view fetches GP5 separately, has no highway data) or for splitscreen's per-panel setup today. A future wave will unify: splitscreen will use setRenderer on its per-panel highway instances, and the pane contract will become the minority path for truly data-independent viz.
+```python
+def setup(app, context):
+    log = context["log"]
+    log.info("plugin ready")
+    log.warning("optional dependency %r not found, feature disabled", dep)
+    try:
+        risky_init()
+    except Exception:
+        log.exception("unhandled error during setup")  # auto-captures traceback
+```
+
+For CLI entry points (scripts that also run as `__main__`), add a stdlib fallback so the logger works without the server pipeline:
+
+```python
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+```
+
+### Diagnostics contribution from frontend (slopsmith#166)
+
+Plugins that hold useful debug state in the browser (active model name, last user input, internal counters) can push it into the diagnostics bundle by calling `window.slopsmith.diagnostics.contribute(plugin_id, payload)` at any time. The contribution API is idempotent — repeated calls overwrite the previous value. Whatever was last contributed before the user hits Export Diagnostics is what lands in `plugins/<plugin_id>/client.json`.
+
+```js
+window.slopsmith.diagnostics.contribute('my_plugin', {
+    schema: 'my_plugin.client_diag.v1',
+    active_preset: getActivePreset(),
+    last_error: _lastError,
+});
+```
+
+Loaded from `static/diagnostics.js` ASAP in `<head>` so the console-wrap is in place before any other script runs. Available on the `window.slopsmith.diagnostics` namespace alongside `snapshotConsole()`, `snapshotHardware()`, `snapshotUa()`, `snapshotLocalStorage()`, `snapshotContributions()`. Keep your payload small (< 100 KB) and don't include secrets — bundles are shared with maintainers.
 
 ### General plugin guidelines
 
@@ -247,6 +334,8 @@ lyrics.json            Syllable-level lyrics (optional)
 ```
 
 Sloppak is the preferred format for new features. The [Sloppak Converter plugin](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) converts PSARCs to sloppak, and the [Stems plugin](https://github.com/topkoa/slopsmith-plugin-stems) provides live stem mixing for sloppak songs.
+
+**Full developer reference:** [docs/sloppak-spec.md](docs/sloppak-spec.md) — manifest schema, arrangement wire format, and how to extend the format with new data types (drum tab, key/scale annotations, etc.).
 
 **Key code:**
 - `lib/sloppak.py` — format detection, zip/directory resolution, metadata extraction, song loading

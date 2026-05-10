@@ -4,6 +4,9 @@ master_difficulty key added in slopsmith#48 PR 2.
 The endpoint must merge only keys present in the request body so that
 single-key POSTs (like the difficulty slider's oninput fire-and-forget)
 don't clobber unrelated settings on disk.
+
+Also covers _get_dlc_dir() precedence: empty/unset DLC_DIR must not
+shadow the config.json dlc_dir fallback.
 """
 
 import importlib
@@ -246,3 +249,232 @@ def test_get_without_master_difficulty_omits_key(client, tmp_path):
     r = client.get("/api/settings")
     assert r.status_code == 200
     assert "master_difficulty" not in r.json()
+
+
+# ── _get_dlc_dir() — env-var / config.json precedence ───────────────────────
+
+@pytest.fixture()
+def server_module(tmp_path, monkeypatch):
+    """Import server with CONFIG_DIR isolated in tmp_path and DLC_DIR unset."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("DLC_DIR", raising=False)
+    sys.modules.pop("server", None)
+    mod = importlib.import_module("server")
+    yield mod
+    meta_db = getattr(mod, "meta_db", None)
+    conn = getattr(meta_db, "conn", None)
+    if conn is not None:
+        conn.close()
+
+
+def test_get_dlc_dir_uses_config_when_env_unset(tmp_path, server_module):
+    """When DLC_DIR is unset, _get_dlc_dir() returns the path from config.json."""
+    dlc_dir = tmp_path / "my_dlc"
+    dlc_dir.mkdir()
+    (tmp_path / "config.json").write_text(json.dumps({"dlc_dir": str(dlc_dir)}))
+
+    result = server_module._get_dlc_dir()
+    assert result == dlc_dir
+
+
+def test_get_dlc_dir_uses_config_when_env_empty(tmp_path, monkeypatch):
+    """When DLC_DIR is set to an empty string, config.json still wins."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("DLC_DIR", "")
+    sys.modules.pop("server", None)
+    mod = importlib.import_module("server")
+    try:
+        dlc_dir = tmp_path / "my_dlc"
+        dlc_dir.mkdir()
+        (tmp_path / "config.json").write_text(json.dumps({"dlc_dir": str(dlc_dir)}))
+        result = mod._get_dlc_dir()
+        assert result == dlc_dir
+    finally:
+        conn = getattr(getattr(mod, "meta_db", None), "conn", None)
+        if conn is not None:
+            conn.close()
+
+
+def test_get_dlc_dir_env_takes_precedence(tmp_path, monkeypatch):
+    """When DLC_DIR env var points to a real directory, it wins over config.json."""
+    env_dir = tmp_path / "env_dlc"
+    env_dir.mkdir()
+    cfg_dir = tmp_path / "cfg_dlc"
+    cfg_dir.mkdir()
+
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("DLC_DIR", str(env_dir))
+    sys.modules.pop("server", None)
+    mod = importlib.import_module("server")
+    try:
+        (tmp_path / "config.json").write_text(json.dumps({"dlc_dir": str(cfg_dir)}))
+        result = mod._get_dlc_dir()
+        assert result == env_dir
+    finally:
+        conn = getattr(getattr(mod, "meta_db", None), "conn", None)
+        if conn is not None:
+            conn.close()
+
+
+def test_get_dlc_dir_env_dot_is_valid(tmp_path, monkeypatch):
+    """An explicit DLC_DIR=. treats the current directory as the DLC folder."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("DLC_DIR", ".")
+    sys.modules.pop("server", None)
+    mod = importlib.import_module("server")
+    try:
+        result = mod._get_dlc_dir()
+        # "." resolves to cwd which exists as a directory
+        assert result is not None
+        assert result.is_dir()
+    finally:
+        conn = getattr(getattr(mod, "meta_db", None), "conn", None)
+        if conn is not None:
+            conn.close()
+
+
+def test_get_dlc_dir_returns_none_when_no_dir(tmp_path, server_module):
+    """Returns None when both env and config.json lack a valid directory."""
+    # No config.json → falls through to None
+    result = server_module._get_dlc_dir()
+    assert result is None
+
+
+def test_get_dlc_dir_ignores_nonexistent_config_dir(tmp_path, server_module):
+    """If config.json names a path that doesn't exist, returns None."""
+    (tmp_path / "config.json").write_text(json.dumps({"dlc_dir": str(tmp_path / "no_such_dir")}))
+    result = server_module._get_dlc_dir()
+    assert result is None
+
+
+# ── psarc_platform setting ────────────────────────────────────────────────────
+
+def test_psarc_platform_default_on_fresh_config(client, tmp_path):
+    """GET /api/settings returns psarc_platform: 'both' on a fresh config."""
+    r = client.get("/api/settings")
+    assert r.status_code == 200
+    assert r.json().get("psarc_platform") == "both"
+
+
+@pytest.mark.parametrize("value", ["both", "pc", "mac"])
+def test_psarc_platform_post_persists(client, tmp_path, value):
+    """POST with a valid psarc_platform value persists to config.json."""
+    r = client.post("/api/settings", json={"psarc_platform": value})
+    assert r.status_code == 200
+    assert _read_cfg(tmp_path)["psarc_platform"] == value
+
+
+def test_psarc_platform_invalid_value_rejected(client, tmp_path):
+    """POST with an invalid psarc_platform value returns a structured error."""
+    (tmp_path / "config.json").write_text(json.dumps({"psarc_platform": "both"}))
+    r = client.post("/api/settings", json={"psarc_platform": "windows"})
+    assert r.status_code == 200
+    assert "error" in r.json()
+    assert _read_cfg(tmp_path)["psarc_platform"] == "both"
+
+
+@pytest.mark.parametrize("bad_value", [42, [], {}, True])
+def test_psarc_platform_non_string_rejected(client, tmp_path, bad_value):
+    """Non-string psarc_platform values are rejected with a structured error."""
+    (tmp_path / "config.json").write_text(json.dumps({"psarc_platform": "both"}))
+    r = client.post("/api/settings", json={"psarc_platform": bad_value})
+    assert r.status_code == 200
+    assert "error" in r.json()
+    assert _read_cfg(tmp_path)["psarc_platform"] == "both"
+
+
+def test_psarc_platform_null_is_noop(client, tmp_path):
+    """Sending psarc_platform: null preserves the on-disk value (no-op)."""
+    (tmp_path / "config.json").write_text(json.dumps({"psarc_platform": "pc"}))
+    r = client.post("/api/settings", json={"psarc_platform": None, "master_difficulty": 50})
+    assert r.status_code == 200
+    assert "error" not in r.json()
+    cfg = _read_cfg(tmp_path)
+    assert cfg["psarc_platform"] == "pc"
+    assert cfg["master_difficulty"] == 50
+
+
+# ── psarc_platform scan filtering ────────────────────────────────────────────
+
+@pytest.fixture()
+def scan_module(tmp_path, monkeypatch, isolate_logging):
+    """Import server with CONFIG_DIR and DLC_DIR isolated in tmp_path."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("DLC_DIR", raising=False)
+    sys.modules.pop("server", None)
+    mod = importlib.import_module("server")
+    yield mod
+    conn = getattr(getattr(mod, "meta_db", None), "conn", None)
+    if conn is not None:
+        conn.close()
+
+
+def _make_psarcs(dlc_dir, names):
+    """Create empty .psarc stub files and return Path objects."""
+    paths = []
+    for name in names:
+        p = dlc_dir / name
+        p.write_bytes(b"")
+        paths.append(p)
+    return paths
+
+
+def test_scan_platform_both_includes_all(tmp_path, scan_module):
+    """With psarc_platform='both', _background_scan includes _p and _m files."""
+    dlc = tmp_path / "dlc"
+    dlc.mkdir()
+    _make_psarcs(dlc, ["song_p.psarc", "song_m.psarc"])
+    (tmp_path / "config.json").write_text(json.dumps({
+        "dlc_dir": str(dlc),
+        "psarc_platform": "both",
+    }))
+
+    import unittest.mock as mock
+    with mock.patch.object(scan_module, "_extract_meta_for_file",
+                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+        scan_module._background_scan()
+
+    # Both files should appear in the DB
+    all_keys = {r[0] for r in scan_module.meta_db.conn.execute("SELECT filename FROM songs").fetchall()}
+    assert "song_p.psarc" in all_keys
+    assert "song_m.psarc" in all_keys
+
+
+def test_scan_platform_pc_excludes_mac_files(tmp_path, scan_module):
+    """With psarc_platform='pc', _background_scan excludes _m.psarc files."""
+    dlc = tmp_path / "dlc"
+    dlc.mkdir()
+    _make_psarcs(dlc, ["song_p.psarc", "song_m.psarc"])
+    (tmp_path / "config.json").write_text(json.dumps({
+        "dlc_dir": str(dlc),
+        "psarc_platform": "pc",
+    }))
+
+    import unittest.mock as mock
+    with mock.patch.object(scan_module, "_extract_meta_for_file",
+                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+        scan_module._background_scan()
+
+    all_keys = {r[0] for r in scan_module.meta_db.conn.execute("SELECT filename FROM songs").fetchall()}
+    assert "song_p.psarc" in all_keys
+    assert "song_m.psarc" not in all_keys
+
+
+def test_scan_platform_mac_excludes_pc_files(tmp_path, scan_module):
+    """With psarc_platform='mac', _background_scan excludes _p.psarc files."""
+    dlc = tmp_path / "dlc"
+    dlc.mkdir()
+    _make_psarcs(dlc, ["song_p.psarc", "song_m.psarc"])
+    (tmp_path / "config.json").write_text(json.dumps({
+        "dlc_dir": str(dlc),
+        "psarc_platform": "mac",
+    }))
+
+    import unittest.mock as mock
+    with mock.patch.object(scan_module, "_extract_meta_for_file",
+                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+        scan_module._background_scan()
+
+    all_keys = {r[0] for r in scan_module.meta_db.conn.execute("SELECT filename FROM songs").fetchall()}
+    assert "song_m.psarc" in all_keys
+    assert "song_p.psarc" not in all_keys

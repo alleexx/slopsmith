@@ -8,7 +8,17 @@ static/art/
 static/audio_*
 plugins/*/
 !plugins/__init__.py
+<<<<<<< HEAD
 docker-compose.yml
 requirements.txt
 docker-compose.yml
 plugins/tabview
+=======
+# Core plugins ship in-tree. They're plugins-as-plugins (plugin loader
+# treats them identically to user-installed ones) but are bundled with
+# the default container image and marked `"bundled": true` in their
+# manifest. Add new core plugins as `!plugins/<id>/` exceptions.
+!plugins/highway_3d/
+!plugins/highway_3d/**
+plugins/highway_3d/__pycache__/
+>>>>>>> 15a55b4eef79dd808ff1d22f007875e0dbb67d61

@@ -226,6 +226,16 @@ function createHighway() {
     // treat them as read-only.
     let _renderer = null;
 
+    // Tracks the rendering context type currently bound to the canvas
+    // element (`'2d'` or `'webgl2'`). Browsers lock a <canvas> to the
+    // first context type successfully acquired for its lifetime, so
+    // when _setRenderer installs a renderer that declares a different
+    // contextType we replace the underlying <canvas> element entirely
+    // (see _replaceCanvas) so the new renderer's getContext() can
+    // succeed. Default 2D — matches what _defaultRenderer.init() does
+    // on the freshly-mounted canvas.
+    let _currentCanvasContextType = '2d';
+
     function _makeBundle() {
         // Snapshot of current factory state passed to each renderer call.
         // Arrays and songInfo are LIVE references, not copies — the bundle
@@ -248,6 +258,10 @@ function createHighway() {
             sections,
             chordTemplates,
             stringCount,
+            // Mirrors song_info tuning capo offsets (±semitones from the
+            // instrument’s standard open-string layout). Live reference.
+            tuning: songInfo?.tuning,
+            capo: songInfo?.capo,
             lyrics,
             toneChanges,
             toneBase,
@@ -394,6 +408,90 @@ function createHighway() {
         }
     }
 
+    function _emitVizReady() {
+        // Notify listeners that the custom renderer has fully initialised
+        // and is actively drawing (its sync init returned, or its async
+        // readyPromise resolved).  App.js uses this to update the Auto
+        // closed-state label only once the renderer is confirmed active.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try { window.slopsmith.emit('viz:renderer:ready', {}); }
+            catch (e) { console.error('viz:renderer:ready emit:', e); }
+        }
+    }
+
+    // Resolve the contextType a renderer expects on the canvas before
+    // its init() runs. Renderer factories may also declare
+    // `factory.contextType = 'webgl2'` so app.js reads it without
+    // constructing the renderer (used in Auto-mode evaluation to gate
+    // WebGL2 renderers on _canRun3D()); here we receive the instance,
+    // so we read the field off the instance itself. Absent → '2d'. The
+    // built-in default renderer is always '2d'.
+    function _resolveRendererContextType(r) {
+        if (r === _defaultRenderer) return '2d';
+        if (r && typeof r.contextType === 'string' && r.contextType) {
+            return r.contextType;
+        }
+        return '2d';
+    }
+
+    // Replace the underlying <canvas> element with a fresh one because
+    // the next renderer needs a different context type than the current
+    // canvas is locked to. Preserves the DOM position, id, classes,
+    // data-* attributes, and inline style cssText so the surrounding
+    // layout (CSS selectors, sibling overlays, splitscreen panels) is
+    // unaffected. Plugins that re-query `getElementById('highway')`
+    // lazily inside their own event handlers automatically pick up the
+    // new element; longer-lived references can listen for the
+    // `highway:canvas-replaced` event emitted at the end.
+    function _replaceCanvas(newType) {
+        if (!canvas) return;
+        const oldCanvas = canvas;
+        // cloneNode(false) preserves the element type and ALL HTML
+        // attributes (id, class, style, data-*, aria-*, role, tabindex,
+        // width/height attribute form, plus anything else a plugin
+        // attached) without copying children — exactly what we need.
+        // It does NOT copy event listeners or expando properties set
+        // imperatively on the JS object (like `canvas._myCtx = gl` or
+        // any plugin-attached data), so any bound rendering context is
+        // left behind on the detached element — which is what allows the
+        // new canvas to start fresh and accept a different getContext()
+        // call. Note: canvas.width/height ARE reflected as HTML
+        // attributes, so those values DO survive the clone; api.resize()
+        // below re-applies the backing-store dimensions anyway.
+        const newCanvas = oldCanvas.cloneNode(false);
+        // Swap in place so siblings, parents, and document order all
+        // stay intact. replaceWith() detaches the old node from the DOM.
+        oldCanvas.replaceWith(newCanvas);
+        canvas = newCanvas;
+        // The default renderer caches its 2D context in the factory
+        // closure (`ctx`). The old reference now points at a detached
+        // canvas — null it so any straggling draw paths short-circuit
+        // instead of painting into the void. The next default-renderer
+        // init() will re-acquire `ctx` from the new canvas via
+        // getContext('2d') (succeeds because the new element is fresh).
+        ctx = null;
+        // Re-size the new element to match the current container —
+        // sets style.width/height and the backing-store width/height.
+        // _renderer.resize is gated on _rendererInited, which has just
+        // been cleared by _destroyCurrentIfInited, so api.resize()
+        // here is a pure dimension update on the new element; the
+        // renderer's own resize fires after init completes.
+        try { api.resize(); }
+        catch (e) { console.error('resize after canvas replace:', e); }
+        _currentCanvasContextType = newType;
+        // Defensive notify for plugins / overlays that cache the
+        // canvas element across events. Lazy lookups via
+        // getElementById('highway') do not need this — they'll pick
+        // up the new element on their next call.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try {
+                window.slopsmith.emit('highway:canvas-replaced', {
+                    oldCanvas, newCanvas, contextType: newType,
+                });
+            } catch (e) { console.error('highway:canvas-replaced emit:', e); }
+        }
+    }
+
     function _setRenderer(r) {
         _destroyCurrentIfInited();
         // null/undefined reverts to default. Anything else must provide
@@ -417,6 +515,19 @@ function createHighway() {
         // song has been played). api.init() will re-run these when it
         // assigns the canvas.
         if (!canvas) return;
+        // Browsers lock a <canvas> to the first context type
+        // successfully acquired for its lifetime: once getContext('2d')
+        // succeeds, getContext('webgl2') on the same element returns
+        // null, and vice versa. When the renderer being installed
+        // declares a different context type than the one already bound,
+        // swap in a fresh <canvas> so the new renderer's init() can
+        // acquire its context cleanly. Previous renderer was already
+        // destroyed by _destroyCurrentIfInited above, so it's safe to
+        // detach the element from the DOM here.
+        const nextType = _resolveRendererContextType(next);
+        if (nextType !== _currentCanvasContextType) {
+            _replaceCanvas(nextType);
+        }
         const bundle = _makeBundle();
         // A renderer without an init() function is treated as ready
         // by default (it simply has no setup to do). If an init()
@@ -447,6 +558,14 @@ function createHighway() {
                     }
                     _renderer = _defaultRenderer;
                     _emitVizReverted('init-failure');
+                    // The just-failed renderer may have already
+                    // acquired its (non-2D) context on the canvas
+                    // before throwing, locking the element to that
+                    // context type. Default renderer is 2D — swap in
+                    // a fresh canvas so its getContext('2d') succeeds.
+                    if (_currentCanvasContextType !== '2d') {
+                        _replaceCanvas('2d');
+                    }
                     if (typeof _renderer.init === 'function') {
                         try {
                             _renderer.init(canvas, _makeBundle());
@@ -466,6 +585,63 @@ function createHighway() {
         if (typeof _renderer.resize === 'function') {
             try { _renderer.resize(canvas.width, canvas.height); }
             catch (e) { console.error('renderer resize:', e); }
+        }
+        // Optional async-ready contract: if the renderer exposes a
+        // `readyPromise`, it initialises asynchronously and the promise
+        // settles when the renderer is actually drawing (resolve) or has
+        // failed without throwing during sync init (reject).
+        // On resolve  → emit viz:renderer:ready so the UI can reflect the
+        //               confirmed active renderer.
+        // On reject   → revert to default, emit viz:reverted (same path as
+        //               a sync init failure) so the UI and Auto label sync.
+        // If readyPromise is absent the sync init was all there was to do;
+        // emit viz:renderer:ready immediately.
+        const _installedRenderer = _renderer;
+        if (_installedRenderer !== _defaultRenderer) {
+            const rp = _installedRenderer.readyPromise;
+            if (rp && typeof rp.then === 'function') {
+                // Named handler for the rejection path so the async error
+                // contract is readable at a glance without unwrapping a long
+                // inline arrow function.
+                function _handleAsyncInitFailure(e) {
+                    if (_renderer !== _installedRenderer) return;
+                    console.error('renderer async init failure:', e);
+                    _destroyCurrentIfInited();
+                    _renderer = _defaultRenderer;
+                    _rendererDrawFailures = 0;
+                    _emitVizReverted('async-init-failure');
+                    if (canvas) {
+                        // Async-init failure usually means the renderer
+                        // got far enough to acquire its (non-2D) context
+                        // before rejecting — the canvas is locked to
+                        // that type. Reverting to the 2D default
+                        // requires a fresh canvas element.
+                        if (_currentCanvasContextType !== '2d') {
+                            _replaceCanvas('2d');
+                        }
+                        let defInitOk = typeof _defaultRenderer.init !== 'function';
+                        if (typeof _defaultRenderer.init === 'function') {
+                            try {
+                                _defaultRenderer.init(canvas, _makeBundle());
+                                defInitOk = true;
+                            } catch (e2) {
+                                console.error('default renderer init after async revert:', e2);
+                            }
+                        }
+                        _rendererInited = defInitOk;
+                        if (_rendererInited && typeof _defaultRenderer.resize === 'function') {
+                            try { _defaultRenderer.resize(canvas.width, canvas.height); }
+                            catch (e2) { console.error('default renderer resize after async revert:', e2); }
+                        }
+                    }
+                }
+                rp.then(
+                    () => { if (_renderer === _installedRenderer) _emitVizReady(); },
+                    _handleAsyncInitFailure
+                );
+            } else {
+                _emitVizReady();
+            }
         }
     }
 
@@ -1972,24 +2148,48 @@ function createHighway() {
                                             // _onReady / song:ready fire.
                                             const audioUrl = msg.audio_url;
                                             _juceRoutingPromise = (async () => {
+                                                let pathLabel = '<missing>';
                                                 try {
                                                     if (await juceApi.isAudioRunning()) {
                                                         if (gen !== _wsGen) return; // stale
                                                         const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(audioUrl)}`);
                                                         if (!res.ok) throw new Error('HTTP ' + res.status);
                                                         const { path } = await res.json();
-                                                        await juceApi.loadBackingTrack(path);
+                                                        pathLabel = (typeof path === 'string' && path.split(/[\\/]/).pop()) || '<missing>';
+                                                        const ok = await juceApi.loadBackingTrack(path);
+                                                        console.log('[highway] JUCE loadBackingTrack file=', pathLabel, 'ok=', ok);
+                                                        if (ok === false) throw new Error('JUCE rejected backing track: ' + pathLabel);
                                                         if (gen !== _wsGen) return; // stale
                                                         if (window.jucePlayer) window.jucePlayer._dur = await juceApi.getBackingDuration();
                                                         if (gen !== _wsGen) return; // stale
                                                         window._juceMode = true;
                                                         window._juceAudioUrl = audioUrl;
+                                                        // Match native backing gain to the Song mixer / persisted volume
+                                                        // (default engine backing is ~0.7 linear; HTML path uses audio.volume).
+                                                        let songPct = window.slopsmith?.audio?.readSongVolume?.();
+                                                        if (!Number.isFinite(songPct)) {
+                                                            try {
+                                                                songPct = parseFloat(localStorage.getItem('volume'));
+                                                            } catch (_e) { songPct = NaN; }
+                                                        }
+                                                        if (!Number.isFinite(songPct)) songPct = 80;
+                                                        songPct = Math.min(100, Math.max(0, songPct));
+                                                        // Don't let setGain failures flip routing back to HTML5 —
+                                                        // the backing track already loaded successfully. Wrap in
+                                                        // its own try/catch and re-check generation after the
+                                                        // await so a reconnect mid-flight can't apply stale state.
+                                                        try {
+                                                            await juceApi.setGain('backing', songPct / 100);
+                                                        } catch (gainErr) {
+                                                            console.warn('[highway] JUCE setGain backing failed', gainErr);
+                                                        }
+                                                        if (gen !== _wsGen) return; // stale
                                                         // Clear the HTML5 element so it does not buffer an unused track
                                                         audio.src = '';
                                                         return;
                                                     }
                                                 } catch (err) {
-                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5:', err);
+                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5 file=', pathLabel, err);
                                                     if (gen !== _wsGen) return; // stale
                                                     window._juceMode = false;
                                                     window._juceAudioUrl = null;

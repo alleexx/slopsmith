@@ -128,9 +128,17 @@ Plugins that want to replace the main highway's draw function (per panel, per se
 ```js
 window.slopsmithViz_my_viz = function () {
     return {
+        // Required canvas context type. Default '2d' if omitted.
+        // highway.js reads this BEFORE calling init() so it can
+        // replace the underlying <canvas> element if the current
+        // one is locked to a different context type (see "Canvas
+        // context-type swapping" below).
+        contextType: '2d', // or 'webgl2'
         init(canvas, bundle) {
             // One-time setup. Own your getContext() call here —
-            // acquire '2d' or 'webgl' depending on the renderer.
+            // acquire '2d' or 'webgl2' depending on the renderer.
+            // The canvas you receive is guaranteed to either be
+            // unbound or already bound to your declared contextType.
             this.ctx = canvas.getContext('2d');
         },
         draw(bundle) {
@@ -176,10 +184,19 @@ Selecting this plugin in the main-player viz picker — or in splitscreen's per-
 **Key rules:**
 - The factory **returns a fresh object on each call** — important for splitscreen, where multiple panels will each get an independent instance.
 - The renderer **owns its own rendering context** (2D or WebGL). Factory will not call getContext for you.
-- **Canvas context caveat — "first context wins".** Browsers lock a canvas element to the first context type successfully acquired for its lifetime: once `getContext('2d')` succeeds, `getContext('webgl')` on that same canvas returns `null`, and vice versa. This produces two asymmetric cases with the renderer picker:
-  - A WebGL renderer *can* work if it is selected **before** `createHighway().init()` has a chance to acquire a 2D context — the restore-saved-selection path in app.js calls `setRenderer` at page load, which stashes the choice; the first `highway.init()` that follows will then install the WebGL renderer directly, and `_defaultRenderer` never grabs a 2D context on that canvas.
-  - But if the default renderer already owns the canvas (the usual case — user picks WebGL from the dropdown mid-session), switching to WebGL on that same canvas fails. The reverse fails too: a canvas that started with a WebGL renderer can't switch back to the default 2D.
-  Supporting arbitrary swaps between 2D and WebGL therefore requires recreating or replacing the canvas element when the context type changes — out of scope for Wave A, but the restore-at-load path is a viable escape hatch for WebGL viz authors today.
+- **Canvas context-type swapping.** Browsers lock a `<canvas>` to the first context type successfully acquired for its lifetime: once `getContext('2d')` succeeds, `getContext('webgl2')` on that same canvas returns `null`, and vice versa. To let arbitrary 2D ⇄ WebGL renderer swaps work mid-session, `highway.setRenderer()` reads the next renderer's `contextType` before calling its `init()` and, if it differs from the type currently bound, replaces the underlying `<canvas>` element with a fresh one via `oldCanvas.cloneNode(false)` followed by `oldCanvas.replaceWith(newCanvas)`. The factory then calls the renderer's `init(newCanvas, bundle)` with the fresh element so its `getContext()` succeeds. Practical implications:
+  - **What survives the swap.** `cloneNode(false)` preserves *every HTML attribute* on the element — `id`, `class`, inline `style`, all `data-*` and `aria-*` attributes, `role`, `tabindex`, the attribute form of `width`/`height`, and anything else a plugin attached. DOM position is preserved by `replaceWith()`, so siblings, parents, and surrounding layout are unaffected.
+  - **What does NOT survive.** Event listeners attached via `addEventListener` are NOT cloned, and expando properties set imperatively on the JavaScript object (such as the bound rendering context, or any `canvas._myPlugin = …`-style data a plugin attached) are not carried over either. The bound rendering context being left behind on the detached element is exactly what allows the new canvas to start fresh and accept a different `getContext()` call. Note: `canvas.width`/`canvas.height` *are* reflected HTML attributes, so those values do survive the clone; `api.resize()` re-applies the backing-store dimensions on the new element after the swap regardless.
+  - Renderers must **declare `contextType`** on the returned instance (`'2d'` or `'webgl2'`; absent → `'2d'`). Factories may also expose it as a static (`window.slopsmithViz_<id>.contextType = 'webgl2'`) so core can read it before constructing the renderer — used today by Auto-mode evaluation.
+  - Plugins that hold a stale reference to the highway canvas across renderer swaps — including any code that registered listeners directly on the canvas element rather than on `window`/`document` — should listen for the `highway:canvas-replaced` event on `window.slopsmith` and re-acquire / re-register. `window.slopsmith.emit` dispatches a `CustomEvent`, so the payload `{ oldCanvas, newCanvas, contextType }` lives on `event.detail`, not on the event object itself:
+    ```js
+    window.slopsmith.on('highway:canvas-replaced', (event) => {
+        const { oldCanvas, newCanvas, contextType } = event.detail;
+        // re-acquire / re-register against newCanvas
+    });
+    ```
+    Plugins that re-query `document.getElementById('highway')` lazily inside their own event handlers don't need this listener — they pick up the new element automatically (it keeps `id="highway"`).
+  - Default-renderer ctx is closure-cached. The replace path nulls the closure ctx so stale draw paths short-circuit; the next default-renderer `init()` re-acquires the 2D context from the new canvas cleanly.
 - `draw(bundle)` receives difficulty-filtered arrays — never read from `_filteredNotes` or other internals.
 - `_drawHooks` fire for the default 2D renderer (the factory calls them at the end of each frame). Custom WebGL renderers that maintain a 2D overlay canvas (like the bundled 3D highway) also call `window.highway.fireDrawHooks(ctx, W, H)` on that overlay so overlay plugins continue to work regardless of which renderer is active. Custom renderers without a 2D overlay context should not attempt to fire hooks.
 
@@ -202,7 +219,7 @@ window.slopsmithViz_piano.matchesArrangement = function (songInfo) {
 - When an Auto-selected renderer fails and core emits `viz:reverted`, the picker falls back to the built-in default and disables auto-switching until the user re-selects Auto.
 - First match wins (picker order), so the registration order of plugins is the tiebreaker. Keep predicates narrow to avoid stealing songs from more specialized viz.
 
-**Known limitation — WebGL viz in Auto mode.** Auto's evaluation happens on `song:ready`, which fires AFTER `highway.init()` has already given the canvas to the default 2D renderer. Installing a WebGL viz at that point fails because the canvas is locked to 2D (see the "first context wins" caveat above). Conversely, reverting from a WebGL-active Auto pick to the default 2D on a no-match song will silently blank the player. Both cases are the same canvas-lock limitation manual picker swaps already have. A future wave will teach highway to recreate the canvas on context-type change. For now, WebGL viz should either be pinned explicitly via the picker (which stores the choice pre-`highway.init()` on reload) or skip `matchesArrangement`.
+**WebGL viz in Auto mode.** Auto evaluation runs on every `song:ready` regardless of which renderer is active. Auto-installing a WebGL renderer when the canvas is currently 2D — or reverting from a WebGL Auto pick to the default 2D — works without a reload because `setRenderer` swaps the canvas element when `contextType` differs (see "Canvas context-type swapping" above). WebGL viz can therefore safely declare `matchesArrangement` and rely on Auto. For 3D Highway specifically, `_canRun3D()` in app.js still gates Auto from picking it on machines without WebGL2 — that fallback is independent of canvas swapping.
 
 #### 2. Overlay contract — for add-on layers
 
@@ -294,6 +311,45 @@ window.slopsmith.diagnostics.contribute('my_plugin', {
 
 Loaded from `static/diagnostics.js` ASAP in `<head>` so the console-wrap is in place before any other script runs. Available on the `window.slopsmith.diagnostics` namespace alongside `snapshotConsole()`, `snapshotHardware()`, `snapshotUa()`, `snapshotLocalStorage()`, `snapshotContributions()`. Keep your payload small (< 100 KB) and don't include secrets — bundles are shared with maintainers.
 
+### Keyboard Shortcuts
+
+Plugins can register keyboard shortcuts via the global `window.registerShortcut()` function. Shortcuts appear in the `?` help panel.
+
+```js
+window.registerShortcut({
+    key: 'k',                       // key value (e.key) or key code (e.code)
+    description: 'Toggle my view',  // shown in the help panel
+    scope: 'player',                // 'global' | 'player' | 'library' | 'settings' | 'plugin-{id}'
+    condition: () => _isMyViewActive, // optional guard
+    handler: (e) => _myAction()      // called when shortcut triggers
+});
+```
+
+**Scope** controls when the shortcut is active:
+- `global` — works on any screen
+- `player` — only on the player screen
+- `library` — only on the home/favorites screens
+- `settings` — only on the settings screen
+- `plugin-{id}` — only when your plugin's screen is active
+
+**Panel-scoped shortcuts:** For plugins that create multiple panels (e.g., splitscreen), shortcuts are automatically scoped to the active panel. Use `const panel = window.createShortcutPanel(id)` to create a panel (it returns the panel object — keep the reference so you can call `panel.clearShortcuts()` during cleanup) and `window.setActiveShortcutPanel(id)` to switch between them. Each panel has its own shortcut registry, so multiple panels can have the same key without collisions.
+
+**Condition** is an optional guard function. If it returns false, the shortcut is skipped even if in scope.
+
+**Key matching:** The handler matches against both `e.key` (character produced) and `e.code` (physical key). Use `e.key` for letters/symbols that depend on keyboard layout, and `e.code` for special keys (e.g. `Space`, `ArrowLeft`).
+
+**Built-in shortcuts:**
+
+| Key | Description |
+|-----|-------------|
+| `?` | Show keyboard shortcuts panel (global) |
+| `Space` | Play/Pause (player only) |
+| `←` / `→` | Seek ±5 seconds (player only) |
+| `Escape` | Back to library (player only) |
+| `[` / `]` | Audio offset ±10ms (Shift: ±50ms) (player only) |
+
+**Debugging:** Open browser console and type `_listShortcuts()` to inspect registered shortcuts.
+
 ### General plugin guidelines
 
 - Wrap your plugin code in an IIFE: `(function () { 'use strict'; ... })();`
@@ -301,6 +357,7 @@ Loaded from `static/diagnostics.js` ASAP in `<head>` so the console-wrap is in p
 - If hooking `window.playSong`, always call the original and `await` it
 - If hooking `window.showScreen`, clean up your state when leaving the player screen
 - Use `window.slopsmith.emit()` / `window.slopsmith.on()` for inter-plugin communication
+- Use `window.registerShortcut()` to add keyboard shortcuts. Clean up with `window.unregisterShortcut(key, scope)` — pass the same scope you registered with, since the default is `'global'` and won't match `player`/`library`/`settings`/`plugin-*` bindings. For panel-scoped shortcuts, prefer `panel.clearShortcuts()`.
 
 ## Song Formats
 

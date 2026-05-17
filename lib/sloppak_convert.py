@@ -335,30 +335,111 @@ def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
 
 def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(out_dir), str(full_ogg)]
-    # Point model-weight caches at the persistent config volume so we don't
-    # re-download on every container restart (~300MB per model).
     env = os.environ.copy()
     config_dir = env.get("CONFIG_DIR", "/config")
     cache_root = Path(config_dir) / "torch_cache"
     cache_root.mkdir(parents=True, exist_ok=True)
     env.setdefault("TORCH_HOME", str(cache_root))
     env.setdefault("XDG_CACHE_HOME", str(cache_root))
+    # Pin demucs to the bundled ffmpeg/ffprobe. demucs.audio probes the
+    # child's PATH for both binaries (ffprobe first, for stream metadata)
+    # and falls back to torchcodec when missing; the desktop bundle's
+    # torchcodec native shims can't load against the vgmstream-patched
+    # FFmpeg DLLs we ship, so the fallback path is broken — we have to
+    # keep demucs on the ffmpeg/ffprobe path. Resolves to resources/bin/
+    # in desktop builds (lib/sloppak_convert.py → resources/slopsmith/lib
+    # → resources/bin). Gate on vgmstream-cli's presence so we don't
+    # accidentally prepend a system /bin/ (Docker's `/app/lib/...`
+    # resolves parents[2] to `/`, and `/bin/ffprobe` exists there too) —
+    # vgmstream-cli is bundled on every desktop platform and isn't a
+    # typical system binary, so it's a precise signature for the
+    # desktop layout.
+    _bundled_bin = Path(__file__).resolve().parents[2] / "bin"
+    if any((_bundled_bin / name).is_file() for name in ("vgmstream-cli", "vgmstream-cli.exe")):
+        # On Windows the env var is conventionally `Path`, not `PATH`;
+        # os.environ is case-insensitive but os.environ.copy() returns a
+        # plain dict that preserves whatever casing the OS used. If we
+        # blindly write to env["PATH"], Windows ends up with both `Path`
+        # and `PATH` keys in the spawned subprocess's env block — and
+        # which one wins is implementation-defined. Reuse the existing
+        # key's casing (or fall through to "PATH" on Linux/macOS).
+        _path_key = next(
+            (k for k in env if k.upper() == "PATH"),
+            "PATH",
+        )
+        # Avoid producing a trailing separator when the parent PATH is
+        # empty/missing — on some platforms a trailing pathsep implicitly
+        # injects the current directory into the search path.
+        _existing_path = env.get(_path_key, "")
+        env[_path_key] = (
+            str(_bundled_bin) + os.pathsep + _existing_path
+            if _existing_path
+            else str(_bundled_bin)
+        )
     # Propagate in-process sys.path additions (plugin loader adds
     # /config/pip_packages at runtime, not via PYTHONPATH) so the child
-    # python can also find demucs/torch/torchcodec.
+    # python can also find demucs/torch/torchcodec. PYTHONPATH alone
+    # is insufficient on Windows embeddable Python, where the ._pth
+    # file forces isolated mode and the env var is ignored — so we
+    # also inject sys.path explicitly via a -c bootstrap before
+    # delegating to demucs.
     pip_target = str(Path(config_dir) / "pip_packages")
-    extra_paths = [p for p in sys.path if p and p != ""]
+    extra_paths = [p for p in sys.path if p]
+    if pip_target not in extra_paths:
+        extra_paths.insert(0, pip_target)
     merged = os.pathsep.join(
-        [pip_target] + [p for p in extra_paths if p != pip_target]
-        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        extra_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
     env["PYTHONPATH"] = merged
+    # torchaudio>=2.11 routes .save() through save_with_torchcodec, which
+    # requires torchcodec. The desktop bundle's torchcodec native shims can't
+    # load against the vgmstream-patched FFmpeg DLLs we ship (see PATH-prepend
+    # rationale above), so the save call dies with OSError; on installs where
+    # torchcodec was dropped from requirements, .save() raises ImportError.
+    # Redirect .save() to soundfile before demucs imports so demucs's per-stem
+    # WAV writes work regardless of torchcodec's state. soundfile is NOT a
+    # transitive demucs dep — the in-app converter plugin (sloppak_converter
+    # >= 1.0.4) ships it via its own requirements.txt, and any other consumer
+    # of this module must do the same. The override stays in place even on
+    # torchaudio versions that wouldn't need it — soundfile's WAV writes are
+    # behaviorally equivalent for demucs's float32 outputs.
+    bootstrap = (
+        "import sys, json, runpy\n"
+        "sys.path[:0] = json.loads(sys.argv[1])\n"
+        "sys.argv = [sys.argv[0]] + sys.argv[2:]\n"
+        "import torchaudio as _ta, soundfile as _sf, numpy as _np\n"
+        "def _ta_save(uri, src, sample_rate, *_a, **_kw):\n"
+        # Honor channels_first (torchaudio default True). demucs calls with
+        # the default; third-party callers may not.
+        "    _cf = _kw.pop('channels_first', True)\n"
+        "    a = src.detach().cpu().numpy() if hasattr(src, 'detach') else _np.asarray(src)\n"
+        "    if a.ndim == 2 and _cf: a = a.T\n"
+        # Pick subtype that preserves bit depth: float32 -> FLOAT,
+        # float64 -> DOUBLE (avoid silent 32-bit downcast), int32 ->
+        # PCM_32, otherwise PCM_16.
+        "    if a.dtype == _np.float64:\n"
+        "        _st = 'DOUBLE'\n"
+        "    elif a.dtype.kind == 'f':\n"
+        "        _st = 'FLOAT'\n"
+        "    elif a.dtype == _np.int32:\n"
+        "        _st = 'PCM_32'\n"
+        "    else:\n"
+        "        _st = 'PCM_16'\n"
+        "    _sf.write(str(uri), a, int(sample_rate), subtype=_st)\n"
+        "_ta.save = _ta_save\n"
+        "runpy.run_module('demucs.__main__', run_name='__main__', alter_sys=True)\n"
+    )
+    cmd = [sys.executable, "-c", bootstrap, json.dumps(extra_paths),
+           "-n", model, "-o", str(out_dir), str(full_ogg)]
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
-        err_tail = (r.stderr or "").strip().splitlines()[-5:]
+        # demucs writes loader errors to stdout, not stderr -- include both
+        # so the surfaced RuntimeError actually points at the cause.
+        out_tail = (r.stdout or "").strip().splitlines()[-8:]
+        err_tail = (r.stderr or "").strip().splitlines()[-8:]
+        tail = " | ".join(out_tail + err_tail) or "(no output)"
         raise RuntimeError(
-            f"demucs exited with code {r.returncode}: " + " | ".join(err_tail)
+            f"demucs exited with code {r.returncode}: " + tail
         )
     track_stem = full_ogg.stem
     result_dir = out_dir / model / track_stem

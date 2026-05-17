@@ -21,4 +21,8 @@ plugins/tabview
 !plugins/highway_3d/
 !plugins/highway_3d/**
 plugins/highway_3d/__pycache__/
->>>>>>> 15a55b4eef79dd808ff1d22f007875e0dbb67d61
+node_modules/
+test-results/
+playwright-report/
+
+/dlc

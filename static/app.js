@@ -163,6 +163,7 @@ let _lastLibSelected = null;
 // song launched from a deep-link / plugin screen still gets a sane
 // fallback ('home').
 let _playerOriginScreen = 'home';
+let _settingsOriginScreen = 'home';
 
 // One-shot flag set in `showScreen` when the user enters Home or
 // Favorites. Consumed by the very next library render so the
@@ -506,24 +507,120 @@ function _trapFocusInModal(modal) {
 // with the version of app.js the user actually loaded.
 function _openShortcutsModal() {
     if (document.getElementById('shortcuts-modal')) return;
-    const SHORTCUTS = [
-        ['Library', [
-            ['/',          'Focus search'],
-            ['↑ ↓ ← →',    'Move selection (grid 2D, tree vertical)'],
-            ['→',          'Tree: expand header / step into open one'],
-            ['←',          'Tree: collapse header / jump to parent'],
-            ['Home / End', 'Jump to first / last item'],
-            ['Enter / Space', 'Play song; toggle artist / album header'],
-            ['c',          'Convert PSARC entry to .sloppak'],
-            ['f',          'Toggle favorite'],
-            ['e',          'Edit metadata'],
-            ['?',          'Show this cheat sheet'],
-        ]],
-        ['Modals', [
-            ['Esc',        'Close the open modal (edit metadata, this overlay)'],
-            ['Esc',        'Otherwise: clear + blur the focused search box'],
-        ]],
+
+    function _isTreeMode() {
+        // Check if we're in tree view (not grid) on the active library screen
+        const screen = document.querySelector('.screen.active');
+        if (!screen) return false;
+        const tree = screen.querySelector('#lib-tree,#fav-tree');
+        return tree && !tree.classList.contains('hidden');
+    }
+
+    const ctx = _getCurrentContext();
+
+    // Library shortcuts that are handled by the navigation system (not in registry)
+    const navShortcuts = [
+        { keys: '↑ ↓', desc: 'Move selection' },
+        { keys: '→', desc: 'Step in', condition: _isTreeMode },
+        { keys: '←', desc: 'Step out', condition: _isTreeMode },
+        { keys: 'Home / End', desc: 'Jump to first / last item' },
+        { keys: 'Enter / Space', desc: 'Activate selection (play song / toggle header)' },
     ];
+
+    // Filter out items whose condition returns false
+    const filterNavItems = (items) => items.filter(item => !item.condition || item.condition());
+
+    // Format a shortcut entry for display, including modifier prefixes
+    const formatShortcut = (s) => {
+        const mods = s.modifiers || {};
+        let label = '';
+        if (mods.ctrl) label += 'Ctrl+';
+        if (mods.alt) label += 'Alt+';
+        if (mods.shift) label += 'Shift+';
+        if (mods.meta) label += 'Meta+';
+        return label + s.key;
+    };
+
+    // Get shortcuts from active panel by scope
+    const getPanelShortcuts = (panel, scope) => {
+        const shortcuts = [];
+        for (const [key, s] of panel.shortcuts) {
+            if (s.scope === scope) {
+                shortcuts.push({ keys: formatShortcut(s), desc: s.description });
+            }
+        }
+        return shortcuts;
+    };
+
+    const activePanel = _panels.get(_activePanel);
+    const defaultPanel = _panels.get('default');
+
+    // Merge shortcuts from both active and default panel for display
+    const mergeShortcuts = (scope) => {
+        const result = [];
+        if (activePanel) result.push(...getPanelShortcuts(activePanel, scope));
+        if (defaultPanel && defaultPanel !== activePanel) result.push(...getPanelShortcuts(defaultPanel, scope));
+        return result;
+    };
+
+    const playerShortcuts = mergeShortcuts('player');
+    const globalShortcuts = mergeShortcuts('global');
+    const libraryShortcuts = mergeShortcuts('library');
+
+    // Get plugin shortcuts for current plugin screen
+    const pluginShortcuts = [];
+    if (ctx.isPlugin && activePanel) {
+        for (const [key, s] of activePanel.shortcuts) {
+            if (s.scope.startsWith('plugin-') && s.scope === ctx.screen) {
+                pluginShortcuts.push({ keys: formatShortcut(s), desc: s.description });
+            }
+        }
+    }
+
+    // Get shortcuts from other panels (if multiple panels exist)
+    const otherPanelShortcuts = [];
+    if (_panels.size > 1) {
+        for (const [panelId, panel] of _panels) {
+            if (panelId === _activePanel) continue;
+            for (const [key, s] of panel.shortcuts) {
+                otherPanelShortcuts.push({ keys: formatShortcut(s), desc: s.description, panel: panelId });
+            }
+        }
+    }
+
+    // Build sections based on current context
+    const sections = [];
+    if (ctx.isSettings) {
+        sections.push({ heading: 'Settings', items: mergeShortcuts('settings') });
+    } else if (ctx.isLibrary) {
+        sections.push({ heading: 'Library', items: [
+            ...filterNavItems(navShortcuts),
+            ...libraryShortcuts,
+            { keys: 'Esc', desc: 'Clear search' }
+        ]});
+    }
+    if (ctx.isPlayer) {
+        sections.push({ heading: 'Player', items: playerShortcuts });
+    }
+    if (!ctx.isSettings && globalShortcuts.length > 0) {
+        sections.push({ heading: 'Global', items: globalShortcuts });
+    }
+    if (pluginShortcuts.length > 0) {
+        sections.push({ heading: 'Current Plugin', items: pluginShortcuts });
+    }
+    if (otherPanelShortcuts.length > 0) {
+        // Group other panel shortcuts by panel
+        const byPanel = new Map();
+        for (const item of otherPanelShortcuts) {
+            if (!byPanel.has(item.panel)) {
+                byPanel.set(item.panel, []);
+            }
+            byPanel.get(item.panel).push(item);
+        }
+        for (const [panelId, items] of byPanel) {
+            sections.push({ heading: `Panel ${panelId}`, items });
+        }
+    }
 
     const modal = document.createElement('div');
     modal.id = 'shortcuts-modal';
@@ -540,8 +637,8 @@ function _openShortcutsModal() {
         && _scModal && _scModal.contains(_lastLibSelected))
         ? _lastLibSelected : null;
 
-    const sections = SHORTCUTS.map(([heading, rows]) => {
-        const items = rows.map(([keys, desc]) => `
+    const sectionsHtml = sections.map(section => {
+        const itemsHtml = section.items.map(({ keys, desc }) => `
             <div class="flex items-baseline justify-between gap-4 py-1.5">
                 <span class="text-sm text-gray-300">${esc(desc)}</span>
                 <kbd class="text-xs font-mono px-2 py-0.5 rounded bg-dark-600 border border-gray-700 text-gray-200 whitespace-nowrap">${esc(keys)}</kbd>
@@ -549,8 +646,8 @@ function _openShortcutsModal() {
         `).join('');
         return `
             <section class="mb-4 last:mb-0">
-                <h4 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">${esc(heading)}</h4>
-                ${items}
+                <h4 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">${esc(section.heading)}</h4>
+                ${itemsHtml}
             </section>
         `;
     }).join('');
@@ -560,12 +657,12 @@ function _openShortcutsModal() {
             <div class="flex items-center justify-between mb-4">
                 <h3 class="text-lg font-bold text-white">Keyboard shortcuts</h3>
                 <button type="button" data-shortcuts-close
-                        class="text-gray-500 hover:text-white transition" aria-label="Close shortcuts">
+                        class="text-gray-500 hover:text-white transition flex items-center gap-1.5" aria-label="Close shortcuts">
+                    <span class="text-xs text-gray-600">Esc</span>
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                 </button>
             </div>
-            ${sections}
-            <p class="text-[11px] text-gray-500 mt-4">Tip: shortcuts bail out while you're typing in inputs, so you can always type the literal keys.</p>
+            ${sectionsHtml}
         </div>
     `;
 
@@ -710,6 +807,8 @@ document.addEventListener('keydown', (e) => {
 
 // ── Screen Navigation ─────────────────────────────────────────────────────
 async function showScreen(id) {
+    // Capture the previous screen before changing active classes
+    const prevScreenId = document.querySelector('.screen.active')?.id;
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById(id).classList.add('active');
     // Mark the next render as a screen-entry so it scrolls the
@@ -721,7 +820,18 @@ async function showScreen(id) {
     _bumpLibNavGeneration();
     if (id === 'home') { _libScrollOnNextRender.home = true; loadLibrary(); }
     if (id === 'favorites') { _libScrollOnNextRender.favorites = true; loadFavorites(); }
-    if (id === 'settings') loadSettings();
+    if (id === 'settings') {
+        // Record where we came from so Esc can go back. The player screen
+        // is torn down by the `id !== 'player'` branch below, so
+        // re-entering it via showScreen() would land on a dead screen —
+        // fall back to the player's own origin (or 'home') instead.
+        if (prevScreenId && prevScreenId !== 'settings') {
+            _settingsOriginScreen = prevScreenId === 'player'
+                ? (_playerOriginScreen || 'home')
+                : prevScreenId;
+        }
+        loadSettings();
+    }
     if (id !== 'player') {
         highway.stop();
         if (window._juceMode) {
@@ -2504,6 +2614,164 @@ const jucePlayer = {
 };
 window.jucePlayer = jucePlayer;
 
+// Desktop JUCE backing uses an empty <audio> element; plugins such as Section Map
+// still seek via audio.currentTime / pause / play. Mirror those onto jucePlayer
+// while _juceMode is active. Same-tick pause+seek coalesce into a single seek
+// (no stopBacking before seek — HTML5 needed that for buffering; JUCE does not).
+let _resetJuceAudioShimChain = function () {};
+(function _installJuceAudioElementShim() {
+    if (!window.slopsmithDesktop?.audio) return;
+
+    const mediaProto = HTMLMediaElement.prototype;
+    const ctDesc = Object.getOwnPropertyDescriptor(mediaProto, 'currentTime');
+    const pausedDesc = Object.getOwnPropertyDescriptor(mediaProto, 'paused');
+    if (!ctDesc?.get || !ctDesc?.set || !pausedDesc?.get) return;
+
+    const nativePlay = mediaProto.play;
+    const nativePause = mediaProto.pause;
+
+    let chain = Promise.resolve();
+    /** Same-tick pause + seek (Section Map): coalesce to one seek — no stopBacking before seek. */
+    let _juceShimBatch = null;
+    let _juceShimBatchFlushScheduled = false;
+    let _juceShimGen = 0;
+    function enqueue(fn) {
+        const gen = _juceShimGen;
+        const p = chain.then(async () => {
+            if (gen !== _juceShimGen) return;
+            return fn(gen);
+        });
+        chain = p.catch((e) => {
+            console.warn('[juce-audio-shim]', e);
+        });
+        return p;
+    }
+    // forUpcomingPlay: caller will enqueue a play() right after, so don't
+    // emit pause-state side effects for a wantsPause batch — play() will
+    // overwrite them anyway.
+    function flushJuceShimBatchNow({ forUpcomingPlay = false } = {}) {
+        _juceShimBatchFlushScheduled = false;
+        const batch = _juceShimBatch;
+        _juceShimBatch = null;
+        if (!batch || !window._juceMode) return;
+        const wantsPause = !!batch.wantsPause;
+        const seekTime = batch.seekTime;
+        if (wantsPause && seekTime !== undefined) {
+            enqueue(async (gen) => {
+                await jucePlayer.seek(seekTime);
+                if (gen !== _juceShimGen) return;
+                if (!forUpcomingPlay) {
+                    await jucePlayer.pause();
+                    if (gen !== _juceShimGen) return;
+                    isPlaying = false;
+                    document.getElementById('btn-play').textContent = '▶ Play';
+                    const sm = window.slopsmith;
+                    if (sm) {
+                        sm.isPlaying = false;
+                        sm.emit('song:pause', { time: jucePlayer.currentTime });
+                    }
+                }
+                audio.dispatchEvent(new Event('seeked'));
+            });
+            return;
+        }
+        if (wantsPause) {
+            enqueue(async (gen) => {
+                await jucePlayer.pause();
+                if (gen !== _juceShimGen) return;
+                isPlaying = false;
+                document.getElementById('btn-play').textContent = '▶ Play';
+                const sm = window.slopsmith;
+                if (sm) {
+                    sm.isPlaying = false;
+                    sm.emit('song:pause', { time: jucePlayer.currentTime });
+                }
+            });
+            return;
+        }
+        if (seekTime !== undefined) {
+            enqueue(async (gen) => {
+                await jucePlayer.seek(seekTime);
+                if (gen !== _juceShimGen) return;
+                audio.dispatchEvent(new Event('seeked'));
+            });
+        }
+    }
+    function scheduleJuceShimBatchFlush() {
+        if (_juceShimBatchFlushScheduled) return;
+        _juceShimBatchFlushScheduled = true;
+        const flushGen = _juceShimGen;
+        queueMicrotask(() => {
+            if (flushGen !== _juceShimGen) {
+                _juceShimBatchFlushScheduled = false;
+                return;
+            }
+            flushJuceShimBatchNow();
+        });
+    }
+    _resetJuceAudioShimChain = function () {
+        chain = Promise.resolve();
+        _juceShimBatch = null;
+        _juceShimBatchFlushScheduled = false;
+        _juceShimGen++;
+    };
+
+    Object.defineProperty(audio, 'currentTime', {
+        get() {
+            if (window._juceMode) return jucePlayer.currentTime;
+            return ctDesc.get.call(this);
+        },
+        set(v) {
+            if (window._juceMode) {
+                const t = Math.max(0, Number(v) || 0);
+                _juceShimBatch = _juceShimBatch || {};
+                _juceShimBatch.seekTime = t;
+                scheduleJuceShimBatchFlush();
+                return;
+            }
+            ctDesc.set.call(this, v);
+        },
+        configurable: true,
+    });
+
+    Object.defineProperty(audio, 'paused', {
+        get() {
+            if (window._juceMode) return !isPlaying;
+            return pausedDesc.get.call(this);
+        },
+        configurable: true,
+    });
+
+    audio.pause = function () {
+        if (window._juceMode) {
+            _juceShimBatch = _juceShimBatch || {};
+            _juceShimBatch.wantsPause = true;
+            scheduleJuceShimBatchFlush();
+            return;
+        }
+        nativePause.call(audio);
+    };
+
+    audio.play = function () {
+        if (window._juceMode) {
+            if (_juceShimBatch != null) flushJuceShimBatchNow({ forUpcomingPlay: true });
+            const p = enqueue(async (gen) => {
+                const started = await jucePlayer.play();
+                if (gen !== _juceShimGen || !started) return;
+                isPlaying = true;
+                document.getElementById('btn-play').textContent = '⏸ Pause';
+                const sm = window.slopsmith;
+                if (sm) {
+                    sm.isPlaying = true;
+                    sm.emit('song:play', { time: jucePlayer.currentTime });
+                }
+            });
+            return p.then(() => undefined);
+        }
+        return nativePlay.call(audio);
+    };
+})();
+
 function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio.currentTime; }
 function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
 async function _audioSeek(s) {
@@ -2536,8 +2804,8 @@ window.slopsmith = Object.assign(new EventTarget(), {
     emit(event, detail) {
         this.dispatchEvent(new CustomEvent(event, { detail }));
     },
-    on(event, fn) { this.addEventListener(event, fn); },
-    off(event, fn) { this.removeEventListener(event, fn); }
+    on(event, fn, options) { this.addEventListener(event, fn, options); },
+    off(event, fn, options) { this.removeEventListener(event, fn, options); }
 });
 if (_slopsmithExisting) {
     for (const key of Object.keys(_slopsmithExisting)) {
@@ -2559,6 +2827,15 @@ function _readSongVolume() {
     }
 }
 audio.volume = _readSongVolume() / 100;
+
+function _adjustSongVolume(delta) {
+    const audioApi = window.slopsmith?.audio;
+    if (!audioApi) return;
+    const current = audioApi.readSongVolume?.() ?? 80;
+    const next = Math.max(0, Math.min(100, Math.round(current + delta)));
+    const songFader = audioApi.getFaders?.().find(f => f.id === 'song');
+    if (songFader) songFader.setValue(next);
+}
 
 // Re-sync audio.volume from the persisted setting whenever a new source
 // finishes loading metadata. Belt + suspenders — some combinations of plugin
@@ -2605,6 +2882,11 @@ async function playSong(filename, arrangement) {
     artAbortController = null;
 
     highway.stop();
+    // Reset the JUCE shim BEFORE awaiting jucePlayer.stop() so any in-flight
+    // shim closures see a stale generation after their await and bail out
+    // before mutating isPlaying / button label / song:* events for the
+    // outgoing song.
+    _resetJuceAudioShimChain();
     if (window._juceMode) {
         await jucePlayer.stop().catch(() => {});
         window._juceMode = false;
@@ -2795,6 +3077,12 @@ if (window.slopsmith) {
     window.slopsmith.on('viz:reverted', (e) => {
         const sel = document.getElementById('viz-picker');
         if (sel) sel.value = 'default';
+        // Cancel any pending viz:renderer:ready label listener — the renderer
+        // that was queued never became (or stayed) active.
+        if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+        // Clear any Auto-resolved label — the renderer that was advertised
+        // never became (or stayed) active.
+        _setAutoVizLabel(null);
         try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
         console.warn(
             `viz picker: reverted to default renderer (${e.detail?.reason || 'unknown'}).`
@@ -3094,6 +3382,15 @@ function setViz(id) {
         highway.setRenderer(null);
     };
 
+    // When switching away from Auto, reset the closed-state label so the
+    // Auto option shows base text the next time the user opens the dropdown.
+    // Also cancel any pending viz:renderer:ready listener from the previous
+    // Auto match cycle so it can't set a stale label after we've moved on.
+    if (id !== 'auto') {
+        if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+        _setAutoVizLabel(null);
+    }
+
     if (id === 'default' || !id) {
         try { localStorage.setItem('vizSelection', id || 'default'); } catch (_) {}
         const _sel = document.getElementById('viz-picker');
@@ -3155,11 +3452,39 @@ function setViz(id) {
 // Enumerates viz plugins by walking the picker's own <option> list —
 // that's the canonical set built by _populateVizPicker above and keeps
 // us from needing a second module-level registry.
+// Helper: update the closed-state label of the Auto option to show what was resolved.
+// Resets to the base label when called with no argument (at evaluation start).
+// _autoVizBaseLabel is captured from the DOM on first call so the reset text
+// always matches the initial markup rather than a hardcoded duplicate.
+let _autoVizBaseLabel = null;
+function _setAutoVizLabel(resolvedText) {
+    const opt = document.querySelector('#viz-picker option[value="auto"]');
+    if (!opt) return;
+    if (_autoVizBaseLabel === null) _autoVizBaseLabel = opt.text;
+    opt.text = resolvedText != null ? `Auto \u2192 ${resolvedText}` : _autoVizBaseLabel;
+}
+
+// Holds a cleanup function for the pending viz:renderer:ready listener
+// registered by _autoMatchViz(). Called at the start of each new evaluation
+// to remove any listener left over from the previous match cycle.
+let _cancelPendingAutoLabel = null;
+
 function _autoMatchViz() {
     const sel = document.getElementById('viz-picker');
     if (!sel) return;
+    // Cancel any pending viz:renderer:ready listener from a previous match
+    // cycle. The song may change before the previous renderer's async init
+    // settles; we don't want that stale listener to clobber the new label.
+    if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+    // Reset label at evaluation start so a stale resolved label never persists
+    // if the song changes or the picker re-evaluates with a different outcome.
+    _setAutoVizLabel(null);
     const songInfo = (typeof highway !== 'undefined' && typeof highway.getSongInfo === 'function')
         ? (highway.getSongInfo() || {}) : {};
+    // Only update the label when a real song is loaded. Before the first
+    // song_info frame, getSongInfo() returns {} — leaving the reset state
+    // ("Auto (match arrangement)") is correct; we haven't evaluated yet.
+    const hasSong = Object.keys(songInfo).length > 0;
     // Options are stable in DOM order, which matches what users see in
     // the picker. The underlying order comes from /api/plugins →
     // _populateVizPicker, and /api/plugins reflects the order the
@@ -3179,13 +3504,15 @@ function _autoMatchViz() {
         .map(o => o.value)
         .filter(v => v !== 'auto' && v !== 'default');
     for (const id of candidateIds) {
-        // 3D Highway gates on WebGL2; if the browser can't run it, skip
-        // it during Auto evaluation so the next candidate (or the 2D
-        // fallback at the end of the loop) takes over instead of
-        // installing a renderer that'll fail at init.
-        if (id === 'highway_3d' && !_canRun3D()) continue;
         const factory = window['slopsmithViz_' + id];
         if (typeof factory !== 'function') continue;
+        // If the factory statically declares contextType='webgl2', gate on
+        // WebGL2 availability so a match never installs a renderer that'll
+        // fail at init. This is the generic version of the old hard-coded
+        // highway_3d check — any future WebGL2 viz gets the same protection
+        // for free without needing a special-case here.
+        const factoryCtxType = typeof factory.contextType === 'string' ? factory.contextType : '2d';
+        if (factoryCtxType === 'webgl2' && !_canRun3D()) continue;
         const predicate = factory.matchesArrangement;
         if (typeof predicate !== 'function') continue;
         let matched = false;
@@ -3207,18 +3534,37 @@ function _autoMatchViz() {
         }
         // Deliberately NOT persisting id — vizSelection stays 'auto' so
         // the next song:ready re-evaluates against the new arrangement.
+        //
+        // Register the viz:renderer:ready listener BEFORE setRenderer() so we
+        // don't miss the event for sync renderers (no readyPromise), which emit
+        // it immediately inside setRenderer(). The _onReady guard still checks
+        // sel.value so a sync init failure (viz:reverted → sel.value='default')
+        // that fires during setRenderer() is handled correctly — the listener
+        // fires but finds sel.value !== 'auto' and skips the label update.
+        if (hasSong) {
+            const matchedOpt = Array.from(sel.options).find(o => o.value === id);
+            const labelText = matchedOpt ? matchedOpt.text : id;
+            function _onReady() { if (sel.value === 'auto') _setAutoVizLabel(labelText); }
+            window.slopsmith.on('viz:renderer:ready', _onReady, { once: true });
+            _cancelPendingAutoLabel = () => window.slopsmith.off('viz:renderer:ready', _onReady);
+        }
         highway.setRenderer(renderer);
         return;
     }
     // No match — restore the built-in 2D highway. setRenderer(null) is
-    // a no-op when the default is already active. KNOWN LIMITATION:
-    // when the previous Auto pick was a WebGL renderer, the canvas has
-    // been locked to 'webgl' by that renderer's init; reverting to the
-    // default 2D renderer will fail silently (see CLAUDE.md "first
-    // context wins"). That's the same limitation manual picker swaps
-    // already have — a future wave will teach highway to recreate the
-    // canvas on context-type change.
+    // a no-op when the default is already active. If the previous Auto
+    // pick was a WebGL renderer, highway.setRenderer() handles the
+    // context-type change by replacing the canvas element (cloneNode +
+    // replaceWith) so the default 2D renderer's getContext('2d') always
+    // succeeds — no canvas-lock limitation here.
     highway.setRenderer(null);
+    // Update the label so the user can see Auto resolved to the built-in
+    // highway. Read from the DOM rather than hard-coding the name so a
+    // future rename of the default entry is automatically reflected.
+    if (hasSong) {
+        const defaultOpt = Array.from(sel.options).find(o => o.value === 'default');
+        _setAutoVizLabel(defaultOpt ? defaultOpt.text : null);
+    }
 }
 
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
@@ -3464,20 +3810,524 @@ setInterval(() => {
     if (!_countingIn) highway.setTime(ct);
 }, 1000 / 60);
 
-// Keyboard shortcuts (player only)
+// ── Centralized Keyboard Shortcut Registry ───────────────────────────────
+//
+// Plugins can register keyboard shortcuts via window.registerShortcut().
+// Shortcuts are scope-aware (global, player, library, plugin-specific) and
+// support optional condition callbacks for dynamic enable/disable.
+//
+// Panel-scoped shortcuts:
+//   - Each panel has its own shortcut registry
+//   - Use window.createShortcutPanel(id) to create a panel
+//   - Use window.setActiveShortcutPanel(id) to set the active panel
+//   - Shortcuts are registered to the active panel
+//   - This allows multiple panels (e.g., splitscreen) to have their own shortcuts
+//
+// API:
+//   window.registerShortcut({
+//     key: string,              // Required: key value (e.key) or key code (e.code)
+//     description: string,     // Required: shown in help panel
+//     scope: 'global' | 'player' | 'library' | 'settings' | 'plugin-{id}',  // Default: 'global'
+//     condition: () => boolean,  // Optional: dynamic enable/disable guard
+//     handler: (e) => void,    // Required: callback when shortcut triggers
+//     modifiers: {              // Optional: require modifier keys
+//       ctrl?: boolean,
+//       alt?: boolean,
+//       shift?: boolean,
+//       meta?: boolean
+//     }
+//   });
+//
+// Panel API:
+//   window.createShortcutPanel(id) - Create a new panel
+//   window.setActiveShortcutPanel(id) - Set the active panel for registration
+//   window.getActiveShortcutPanel() - Get the current active panel
+//   window.isInShortcutPanel() - Check if running in a panel (not default)
+//   window.getGlobalShortcutContext() - Get default panel for truly global shortcuts
+//
+// Note: The handler receives the KeyboardEvent, so you can check
+// e.shiftKey, e.altKey, etc. directly in your handler if you need
+// behavior that depends on modifier state (e.g., different actions
+// for Shift+key vs key alone). Use the modifiers option when you
+// want the shortcut to ONLY fire with specific modifiers.
+//
+// See CLAUDE.md for full documentation.
+
+// ── Window ID system for per-window shortcuts ────────────────────────────────
+// Each window gets a unique ID so plugins can register window-specific shortcuts.
+// This is useful for popup windows (e.g., splitscreen plugin) that need their
+// own keyboard shortcuts.
+
+let _shortcutWindowId = null;
+
+window.getShortcutWindowId = () => {
+    if (_shortcutWindowId) return _shortcutWindowId;
+    // Generate a unique ID for this window
+    _shortcutWindowId = 'win-' + Math.random().toString(36).substr(2, 9);
+    return _shortcutWindowId;
+};
+
+// ── Shortcut registry ───────────────────────────────────────────────────────
+
+// ── Panel-scoped shortcut system ───────────────────────────────────────────
+// Each panel has its own shortcut registry. This allows multiple panels
+// (e.g., splitscreen) to have their own keyboard shortcuts without collisions.
+
+class ShortcutPanel {
+    constructor(id) {
+        this.id = id;
+        this.shortcuts = new Map();
+    }
+    
+    _compositeKey(key, scope) {
+        return `${scope}::${key}`;
+    }
+    
+    registerShortcut(options) {
+        const { key, description, scope = 'global', condition = null, handler, modifiers = null } = options;
+        
+        if (!key || !handler) {
+            console.error(`registerShortcut: key and handler are required`);
+            return;
+        }
+        
+        // Validate scope
+        const validScopes = ['global', 'player', 'library', 'settings'];
+        const isValidScope = validScopes.includes(scope) || 
+                             scope.startsWith('plugin-');
+        if (!isValidScope) {
+            console.warn(`registerShortcut: invalid scope '${scope}'. Valid scopes are: global, player, library, settings, or plugin-{id}`);
+        }
+        
+        // Conflict detection: warn if key+scope is already registered
+        const compositeKey = this._compositeKey(key, scope);
+        if (this.shortcuts.has(compositeKey)) {
+            console.warn(`registerShortcut [${this.id}]: '${key}' in scope '${scope}' is already registered; overwriting. Previous:`, this.shortcuts.get(compositeKey));
+        }
+        
+        this.shortcuts.set(compositeKey, { key, description, scope, condition, handler, modifiers });
+    }
+    
+    unregisterShortcut(key, scope) {
+        return this.shortcuts.delete(this._compositeKey(key, scope));
+    }
+    
+    clearShortcuts() {
+        this.shortcuts.clear();
+    }
+    
+    listShortcuts() {
+        return Array.from(this.shortcuts.entries()).map(([ck, s]) => [s.key, s]);
+    }
+}
+
+// Global panel management
+const _panels = new Map();
+let _activePanel = null;
+let _defaultPanel = null;
+
+// Create default panel on init
+const defaultPanel = new ShortcutPanel('default');
+_panels.set('default', defaultPanel);
+_defaultPanel = 'default';
+_activePanel = 'default';
+
+// ── Panel API ───────────────────────────────────────────────────────────────
+
+window.createShortcutPanel = (id) => {
+    if (_panels.has(id)) {
+        console.warn(`createShortcutPanel: panel '${id}' already exists`);
+        return _panels.get(id);
+    }
+    const panel = new ShortcutPanel(id);
+    _panels.set(id, panel);
+    return panel;
+};
+
+window.setActiveShortcutPanel = (id) => {
+    if (!_panels.has(id)) {
+        console.error(`setActiveShortcutPanel: panel '${id}' does not exist`);
+        return;
+    }
+    _activePanel = id;
+};
+
+window.getActiveShortcutPanel = () => _activePanel;
+
+window.isInShortcutPanel = () => {
+    return _activePanel !== 'default';
+};
+
+window.getGlobalShortcutContext = () => {
+    console.warn('getGlobalShortcutContext: Global shortcuts are exceptional. Consider using panel-scoped shortcuts instead.');
+    return _panels.get('default');
+};
+
+// ── Shortcut registry (routes to active panel) ───────────────────────────────
+
+window.registerShortcut = (options) => {
+    const panelId = _activePanel || _defaultPanel || 'default';
+    const panel = _panels.get(panelId);
+    
+    if (!panel) {
+        console.error(`registerShortcut: No panel found for registration: ${panelId}`);
+        return;
+    }
+    
+    panel.registerShortcut(options);
+};
+
+window.unregisterShortcut = (key, scope) => {
+    // Try the active panel first to preserve panel isolation; fall back to
+    // other panels so a shortcut registered before a panel switch is still
+    // removable.
+    const resolvedScope = scope || 'global';
+    const activePanelId = _activePanel || _defaultPanel || 'default';
+    const activePanel = _panels.get(activePanelId);
+    if (activePanel && activePanel.unregisterShortcut(key, resolvedScope)) {
+        return true;
+    }
+    for (const [panelId, panel] of _panels) {
+        if (panelId === activePanelId) continue;
+        if (panel.unregisterShortcut(key, resolvedScope)) {
+            return true;
+        }
+    }
+    return false;
+};
+
+window.clearWindowShortcuts = (windowId) => {
+    // Remove all shortcuts registered for a specific window
+    // This is for backward compatibility with window-specific shortcuts
+    let removed = 0;
+    for (const [panelId, panel] of _panels) {
+        if (panelId.startsWith(`window-${windowId}`)) {
+            panel.clearShortcuts();
+            _panels.delete(panelId);
+            removed++;
+        }
+    }
+    return removed;
+};
+
+function _getCurrentContext() {
+    const currentScreen = document.querySelector('.screen.active')?.id;
+    return {
+        screen: currentScreen,
+        windowId: window.getShortcutWindowId(),
+        activePanel: _activePanel,
+        isPlayer: currentScreen === 'player',
+        isLibrary: ['home', 'favorites'].includes(currentScreen),
+        isSettings: currentScreen === 'settings',
+        isPlugin: currentScreen?.startsWith('plugin-')
+    };
+}
+
+function _isShortcutActive(shortcut, ctx) {
+    if (shortcut.scope === 'global') return true;
+    if (shortcut.scope === 'player' && ctx.isPlayer) return true;
+    if (shortcut.scope === 'library' && ctx.isLibrary) return true;
+    if (shortcut.scope === 'settings' && ctx.isSettings) return true;
+    if (shortcut.scope.startsWith('plugin-')) {
+        const pluginId = shortcut.scope.replace('plugin-', '');
+        return ctx.screen === `plugin-${pluginId}`;
+    }
+    return false;
+}
+
+function _modifiersMatch(e, modifiers) {
+    if (!modifiers) return true;
+    if (modifiers.ctrl !== undefined && modifiers.ctrl !== e.ctrlKey) return false;
+    if (modifiers.alt !== undefined && modifiers.alt !== e.altKey) return false;
+    if (modifiers.shift !== undefined && modifiers.shift !== e.shiftKey) return false;
+    if (modifiers.meta !== undefined && modifiers.meta !== e.metaKey) return false;
+    return true;
+}
+
+// Debug mode for keyboard shortcuts
+let _DEBUG_SHORTCUTS = false;
+
+window._setDebugShortcuts = (enabled) => {
+    _DEBUG_SHORTCUTS = enabled;
+    console.log(`[Shortcuts] Debug mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
+};
+
+window._listShortcuts = () => {
+    console.log('=== Registered Shortcuts ===');
+    for (const [panelId, panel] of _panels) {
+        console.log(`Panel: ${panelId}`);
+        for (const [, s] of panel.shortcuts) {
+            console.log(`  ${s.key.padEnd(15)} | ${s.scope.padEnd(10)} | ${s.description}`);
+        }
+    }
+    console.log('=== End ===');
+};
+
+window._testShortcut = (key, scope) => {
+    // Mirror the dispatcher: try the active panel first, then default.
+    const resolvedScope = scope || 'global';
+    const tried = new Set();
+    const panelOrder = [_activePanel, _defaultPanel, 'default'].filter(id => {
+        if (!id || tried.has(id)) return false;
+        tried.add(id);
+        return true;
+    });
+
+    for (const panelId of panelOrder) {
+        const panel = _panels.get(panelId);
+        if (!panel) continue;
+        const shortcut = panel.shortcuts.get(panel._compositeKey(key, resolvedScope));
+        if (!shortcut) continue;
+
+        const ctx = _getCurrentContext();
+        const active = _isShortcutActive(shortcut, ctx);
+        let conditionMet = true;
+        if (shortcut.condition) {
+            try { conditionMet = !!shortcut.condition(); }
+            catch (err) { conditionMet = `threw: ${err.message}`; }
+        }
+        console.log(`Shortcut '${key}' [${resolvedScope}] [${panelId}]:`, {
+            description: shortcut.description,
+            scope: shortcut.scope,
+            currentContext: ctx,
+            isActive: active,
+            conditionMet
+        });
+        return;
+    }
+
+    console.log(`Shortcut '${key}' (scope: ${resolvedScope}) not registered in any panel`);
+};
+
+// Expose internals for debugging (prefixed with _ to indicate private)
+// These are for development/debugging only and should not be used by plugins.
+window._panels = _panels;
+window._getCurrentContext = _getCurrentContext;
+window._isShortcutActive = _isShortcutActive;
+
+// ── Registry-based keydown handler ─────────────────────────────────────────
+//
+// This handler processes all registered shortcuts through the central registry.
+// It runs after the library navigation handler (which handles /, ?, c, f, e, etc.)
+// and before any other keydown listeners.
+
 document.addEventListener('keydown', e => {
-    if (!document.getElementById('player').classList.contains('active')) return;
-    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
-    else if (e.code === 'ArrowLeft') seekBy(-5);
-    else if (e.code === 'ArrowRight') seekBy(5);
-    else if (e.code === 'Escape') showScreen(_playerOriginScreen || 'home');
-    // A/V offset live-calibration — watch the highway and listen to
-    // the audio while tuning. Shift for coarse ±50 ms, bare key for
-    // fine ±10 ms. Match on e.key (the produced character) rather
-    // than e.code (physical-key position) so layouts where `[`/`]`
-    // are AltGr combinations (QWERTZ, AZERTY) still fire correctly.
-    else if (e.key === '[') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ? -50 : -10); }
-    else if (e.key === ']') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ?  50 :  10); }
+    // Don't intercept if typing in an input field
+    if (_isTextInput(e.target) || _isInsideInteractiveControl(e.target)) return;
+
+    const ctx = _getCurrentContext();
+    const activePanel = _panels.get(_activePanel);
+    const defaultPanel = _panels.get('default');
+    
+    if (!activePanel && !defaultPanel) return;
+
+    if (_DEBUG_SHORTCUTS) {
+        console.log('[Shortcuts] Key pressed:', { key: e.key, code: e.code, ctx, activePanel: _activePanel });
+    }
+
+    // Try active panel first, then fall back to default
+    const panelsToDispatch = [];
+    if (activePanel && activePanel !== defaultPanel) panelsToDispatch.push(activePanel);
+    if (defaultPanel) panelsToDispatch.push(defaultPanel);
+
+    for (const panel of panelsToDispatch) {
+        for (const [, shortcut] of panel.shortcuts) {
+        // Match on both e.key (character produced) and e.code (physical key)
+        if (e.key !== shortcut.key && e.code !== shortcut.key) continue;
+
+        // Check modifier keys if specified
+        if (!_modifiersMatch(e, shortcut.modifiers)) continue;
+
+        if (_DEBUG_SHORTCUTS) {
+            console.log('[Shortcuts] Matched shortcut:', shortcut.key, shortcut);
+        }
+
+        // Check scope
+        if (!_isShortcutActive(shortcut, ctx)) {
+            if (_DEBUG_SHORTCUTS) {
+                console.log('[Shortcuts] Not active - scope mismatch:', shortcut.scope, ctx);
+            }
+            continue;
+        }
+
+        // Check condition callback — guard against plugin errors
+        if (shortcut.condition) {
+            try {
+                if (!shortcut.condition()) {
+                    if (_DEBUG_SHORTCUTS) {
+                        console.log('[Shortcuts] Not active - condition failed');
+                    }
+                    continue;
+                }
+            } catch (err) {
+                console.error('[Shortcuts] condition() threw for key:', shortcut.key, err);
+                continue;
+            }
+        }
+
+        e.preventDefault();
+        if (_DEBUG_SHORTCUTS) {
+            console.log('[Shortcuts] Executing handler for:', shortcut.key);
+        }
+        // Guard handler against plugin errors
+        try {
+            shortcut.handler(e);
+        } catch (err) {
+            console.error('[Shortcuts] handler() threw for key:', shortcut.key, err);
+        }
+        return;
+    }
+}
+
+    if (_DEBUG_SHORTCUTS) {
+        console.log('[Shortcuts] No shortcut matched for:', e.key, e.code);
+    }
+});
+
+// ── Window cleanup ───────────────────────────────────────────────────────────
+// Clean up window-specific shortcuts when a window is closed.
+// This is important for popup windows (e.g., splitscreen plugin) that
+// may be closed by the user.
+
+window.addEventListener('beforeunload', () => {
+    const windowId = window.getShortcutWindowId();
+    const removed = window.clearWindowShortcuts(windowId);
+    if (removed > 0 && _DEBUG_SHORTCUTS) {
+        console.log(`[Shortcuts] Cleaned up ${removed} shortcuts for window ${windowId}`);
+    }
+});
+
+// ── Register built-in shortcuts ───────────────────────────────────────────
+
+// Global shortcuts
+registerShortcut({
+    key: '?',
+    description: 'Show keyboard shortcuts',
+    scope: 'global',
+    handler: () => _openShortcutsModal()
+});
+
+// Library shortcuts
+registerShortcut({
+    key: '/',
+    description: 'Focus search',
+    scope: 'library',
+    handler: () => {
+        const input = _activeSearchInput();
+        if (input) input.focus();
+    }
+});
+
+registerShortcut({
+    key: 'c',
+    description: 'Convert PSARC entry to .sloppak',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+registerShortcut({
+    key: 'f',
+    description: 'Toggle favorite',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+registerShortcut({
+    key: 'e',
+    description: 'Edit metadata',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+// Player shortcuts
+registerShortcut({
+    key: 'Space',
+    description: 'Play/Pause',
+    scope: 'player',
+    handler: () => togglePlay()
+});
+
+registerShortcut({
+    key: 'ArrowLeft',
+    description: 'Seek back 5 seconds',
+    scope: 'player',
+    handler: () => seekBy(-5)
+});
+
+registerShortcut({
+    key: 'ArrowRight',
+    description: 'Seek forward 5 seconds',
+    scope: 'player',
+    handler: () => seekBy(5)
+});
+
+registerShortcut({
+    key: 'Escape',
+    description: 'Back to library',
+    scope: 'player',
+    handler: () => showScreen(_playerOriginScreen || 'home')
+});
+
+registerShortcut({
+    key: 'Escape',
+    description: 'Go back to previous screen',
+    scope: 'settings',
+    handler: () => showScreen(_settingsOriginScreen || 'home')
+});
+
+registerShortcut({
+    key: '[',
+    description: 'Offset audio back (Shift: 50ms, else 10ms)',
+    scope: 'player',
+    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? -50 : -10)
+});
+
+registerShortcut({
+    key: ']',
+    description: 'Offset audio forward (Shift: 50ms, else 10ms)',
+    scope: 'player',
+    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? 50 : 10)
+});
+
+registerShortcut({
+    key: '+',
+    description: 'Volume up',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(1)
+});
+
+// Layout-portable alias — matches the physical "=/+" key (e.code === 'Equal')
+// regardless of keyboard layout or shift state, so non-US layouts that
+// don't map Shift+= to '+' still work.
+registerShortcut({
+    key: 'Equal',
+    description: 'Volume up',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(1)
+});
+
+registerShortcut({
+    key: '-',
+    description: 'Volume down',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(-1)
+});
+
+registerShortcut({
+    key: 'Minus',
+    description: 'Volume down',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(-1)
 });
 
 // ── Edit metadata modal ─────────────────────────────────────────────────
@@ -3684,6 +4534,7 @@ function showScanBanner() {
             </div>
             <div class="progress-bar"><div class="fill" id="scan-bar" style="width:0%"></div></div>
             <p class="text-xs text-gray-500 mt-1 truncate" id="scan-file">Starting...</p>
+            <p class="text-xs text-blue-400/70 mt-1 hidden" id="scan-first-note">First-time import — results are cached for future launches</p>
         </div>
         <button onclick="hideScanBanner()" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition flex-shrink-0">Dismiss</button>`;
     document.body.appendChild(el);
@@ -3705,8 +4556,10 @@ async function pollScanStatus() {
             showScanBanner();
             const file = document.getElementById('scan-file');
             const prog = document.getElementById('scan-progress');
+            const firstNote = document.getElementById('scan-first-note');
             if (file) { file.textContent = 'Scan failed: ' + data.error; file.classList.add('text-red-400'); }
             if (prog) prog.textContent = 'Error';
+            if (firstNote) firstNote.classList.add('hidden');
             clearInterval(_scanPollId);
             _scanPollId = null;
             return;
@@ -3717,12 +4570,14 @@ async function pollScanStatus() {
             const bar = document.getElementById('scan-bar');
             const prog = document.getElementById('scan-progress');
             const file = document.getElementById('scan-file');
+            const firstNote = document.getElementById('scan-first-note');
             if (bar) bar.style.width = pct + '%';
             if (prog) prog.textContent = `${data.done} / ${data.total} (${pct}%)`;
             if (file) {
                 const name = (data.current || '').replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
                 file.textContent = name || (data.stage === 'listing' ? 'Listing DLC folder...' : 'Processing...');
             }
+            if (firstNote) firstNote.classList.toggle('hidden', !data.is_first_scan);
         } else {
             if (document.getElementById('scan-banner')) {
                 hideScanBanner();
@@ -3740,6 +4595,8 @@ async function checkScanAndLoad() {
     const data = await resp.json();
     if (data.running) {
         showScanBanner();
+        const firstNote = document.getElementById('scan-first-note');
+        if (firstNote) firstNote.classList.toggle('hidden', !data.is_first_scan);
         _scanPollId = setInterval(pollScanStatus, 1000);
     }
     loadLibrary();
@@ -3883,11 +4740,85 @@ async function loadPlugins() {
 
         const settingsContainer = document.getElementById('plugin-settings');
 
-        // One-shot hydration guard: always clear plugin-owned containers first.
+        // Plugins whose screen.js has already been evaluated this session
+        // at the current version AND whose DOM is still in the document.
+        // Their listeners were bound to the existing settings / screen DOM,
+        // so we must preserve that DOM — the script load guard below skips
+        // re-evaluating screen.js, and a fresh empty DOM with no listeners
+        // would leave the plugin half-hydrated on subsequent loadPlugins()
+        // calls (e.g. _scheduleStartupRehydration).
+        //
+        // The DOM-existence check is the safety net for plugins that
+        // disappeared and reappeared between calls (uninstall + reinstall,
+        // or a backend snapshot churn that drops a plugin then restores
+        // it). In that case the loadedScripts key would still be set, but
+        // any listeners are bound to elements that have since been removed
+        // — drop the stale key so screen.js re-runs against the fresh DOM
+        // we're about to inject.
+        // Map<pluginId, version> — one entry per plugin. Storing only the
+        // currently-loaded version (rather than a Set of all (id, version)
+        // pairs ever loaded) means upgrade → downgrade → upgrade cycles
+        // within one session don't leave stale keys that could mistakenly
+        // mark an old version as already-hydrated. Coerce a legacy Set, if
+        // present, to an empty Map — the previous shape never shipped.
+        let loadedScripts = window.slopsmith._loadedPluginScripts;
+        if (!(loadedScripts instanceof Map)) {
+            loadedScripts = new Map();
+            window.slopsmith._loadedPluginScripts = loadedScripts;
+        }
+        const _removePluginScriptTags = (pluginId) => {
+            // Filter via dataset rather than a CSS attribute selector —
+            // CSS.escape is not universally available, and plugin IDs
+            // aren't constrained server-side.
+            document.querySelectorAll('script[data-plugin-id]').forEach((s) => {
+                if (s.dataset.pluginId === pluginId) s.remove();
+            });
+        };
+        const existingSettingsByPluginId = new Map();
+        if (settingsContainer) {
+            for (const child of settingsContainer.children) {
+                const pid = child.dataset ? child.dataset.pluginId : null;
+                if (pid) existingSettingsByPluginId.set(pid, child);
+            }
+        }
+        const alreadyHydrated = new Set();
+        for (const p of plugins) {
+            if (!p.has_script) continue;
+            // Version must match exactly — an upgrade / downgrade has to
+            // re-run the new script against fresh DOM.
+            if (loadedScripts.get(p.id) !== (p.version || '')) continue;
+            const screenOk = !p.has_screen || !!document.getElementById(`plugin-${p.id}`);
+            const settingsOk = !p.has_settings || existingSettingsByPluginId.has(p.id);
+            if (screenOk && settingsOk) {
+                alreadyHydrated.add(p.id);
+            } else {
+                // DOM was wiped externally (uninstall + reinstall, snapshot
+                // churn) — drop the entry and remove the orphaned <script>
+                // so screen.js re-runs against fresh DOM below.
+                loadedScripts.delete(p.id);
+                _removePluginScriptTags(p.id);
+            }
+        }
+
+        // Clear plugin-owned containers, but keep already-hydrated plugins'
+        // settings / screen DOM. Nav links carry no per-plugin script state,
+        // so always rebuild them.
         navContainer.innerHTML = '';
         mobileNavContainer.innerHTML = '<span class="text-xs text-gray-600 uppercase tracking-wider">Plugins</span>';
-        if (settingsContainer) settingsContainer.innerHTML = '';
-        document.querySelectorAll('.screen[id^="plugin-"]').forEach((el) => el.remove());
+        if (settingsContainer) {
+            [...settingsContainer.children].forEach((el) => {
+                const pid = el.dataset ? el.dataset.pluginId : null;
+                if (!pid || !alreadyHydrated.has(pid)) el.remove();
+            });
+        }
+        document.querySelectorAll('.screen[id^="plugin-"]').forEach((el) => {
+            // dataset.pluginId is the source of truth (set on injection);
+            // the id-prefix fallback covers screens injected before this
+            // change shipped — both forms strip a single leading "plugin-".
+            const pid = (el.dataset && el.dataset.pluginId)
+                || el.id.replace(/^plugin-/, '');
+            if (!alreadyHydrated.has(pid)) el.remove();
+        });
 
         // Plugin settings area hosts both "Plugin Updates" and per-plugin
         // collapsibles. Reveal it whenever any plugins are installed —
@@ -3939,11 +4870,17 @@ async function loadPlugins() {
             try {
             const screenId = `plugin-${plugin.id}`;
 
-            // Inject screen container
-            if (plugin.has_screen) {
+            // Inject screen container. Skip for already-hydrated plugins —
+            // their existing screen DOM still has the listeners that
+            // screen.js bound on first load (rebuilding here would orphan
+            // them, since the script load guard further down won't re-run
+            // screen.js to re-bind).
+            if (plugin.has_screen && !alreadyHydrated.has(plugin.id)) {
                 const screenDiv = document.createElement('div');
                 screenDiv.id = screenId;
                 screenDiv.className = 'screen';
+                screenDiv.dataset.pluginId = plugin.id;
+                screenDiv.dataset.pluginVersion = plugin.version || '';
                 // Insert before the player screen
                 const player = document.getElementById('player');
                 player.parentNode.insertBefore(screenDiv, player);
@@ -3955,9 +4892,14 @@ async function loadPlugins() {
             // Inject settings section — wrapped in a collapsible <details>
             // per plugin so the page stays scannable as plugins accumulate.
             // Collapsed by default; <details>/<summary> handles state natively.
-            if (plugin.has_settings && settingsContainer) {
+            // Skip for already-hydrated plugins — preserved details element
+            // still carries listeners wired by its inline settings script
+            // and by screen.js on first load.
+            if (plugin.has_settings && settingsContainer && !alreadyHydrated.has(plugin.id)) {
                 const details = document.createElement('details');
                 details.className = 'bg-dark-700/40 border border-gray-800 rounded-xl overflow-hidden group';
+                details.dataset.pluginId = plugin.id;
+                details.dataset.pluginVersion = plugin.version || '';
 
                 const summary = document.createElement('summary');
                 // .plugin-settings-summary class hides the browser's native
@@ -4073,13 +5015,27 @@ async function loadPlugins() {
 
             // Load plugin JS
             if (plugin.has_script) {
-                await new Promise((resolve, reject) => {
-                    const script = document.createElement('script');
-                    script.src = `/api/plugins/${plugin.id}/screen.js`;
-                    script.onload = resolve;
-                    script.onerror = reject;
-                    document.body.appendChild(script);
-                });
+                const wantedVersion = plugin.version || '';
+                if (loadedScripts.get(plugin.id) !== wantedVersion) {
+                    // A different version (or none) was loaded previously —
+                    // remove the prior <script> tag for this plugin id so we
+                    // don't accumulate stale versions on upgrade/downgrade.
+                    _removePluginScriptTags(plugin.id);
+                    await new Promise((resolve, reject) => {
+                        const script = document.createElement('script');
+                        // Include version in URL so a plugin upgrade within the
+                        // same browser session fetches the new screen.js instead
+                        // of a cached copy keyed only by path (matches the art
+                        // URL ?v=mtime convention elsewhere in this file).
+                        const v = encodeURIComponent(wantedVersion);
+                        script.src = `/api/plugins/${plugin.id}/screen.js${v ? `?v=${v}` : ''}`;
+                        script.dataset.pluginId = plugin.id;
+                        script.dataset.pluginVersion = wantedVersion;
+                        script.onload = () => { loadedScripts.set(plugin.id, wantedVersion); resolve(); };
+                        script.onerror = (err) => { loadedScripts.delete(plugin.id); reject(err); };
+                        document.body.appendChild(script);
+                    });
+                }
             }
             } catch (e) {
                 console.warn(`Plugin '${plugin.id}' failed to load, skipping:`, e);

@@ -14,3 +14,11 @@ structlog>=24.1.0
 asgi-correlation-id>=4.3.3
 psutil>=5.9.0
 py-cpuinfo>=9.0.0
+yt-dlp>=2024.1.0
+librosa>=0.8.0
+mir-eval>=0.6
+pretty-midi>=0.2.9
+resampy>=0.4.3
+scikit-learn
+scipy>=1.4.1
+onnxruntime

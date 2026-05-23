@@ -24,5 +24,9 @@ plugins/highway_3d/__pycache__/
 node_modules/
 test-results/
 playwright-report/
-
 /dlc
+rscli/obj/Debug/**
+plugins/tabview
+.claude/settings.local.json
+test_transcribe_piano.py
+test_transcribe_flow.py

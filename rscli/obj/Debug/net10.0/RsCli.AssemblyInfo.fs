@@ -10,7 +10,7 @@ open System.Reflection
 [<assembly: System.Reflection.AssemblyCompanyAttribute("RsCli")>]
 [<assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")>]
 [<assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")>]
-[<assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3a8b9ca1203ed0005571f6af6faf1919f62d7b2c")>]
+[<assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a675f52fdae386c04608efa1c9ce21ba86ce3a94")>]
 [<assembly: System.Reflection.AssemblyProductAttribute("RsCli")>]
 [<assembly: System.Reflection.AssemblyTitleAttribute("RsCli")>]
 [<assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")>]

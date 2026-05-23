@@ -39,6 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     unzip \
     megatools \
+    build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # vgmstream-cli
@@ -53,7 +55,9 @@ COPY --from=builder /opt/rscli /opt/rscli
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --no-deps basic-pitch==0.4.0
 
 COPY lib/ /app/lib/
 COPY static/ /app/static/

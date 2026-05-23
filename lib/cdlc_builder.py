@@ -207,6 +207,9 @@ def build_cdlc(
         # ── Convert XMLs to SNG ───────────────────────────────────────────
         arrangements_info = []
         manifests = []
+        song_length = 300.0  # Default fallback
+
+        log.info(f"[Build] Processing {len(xml_paths)} arrangements: {arrangement_names}")
 
         for i, (xml_path, arr_name) in enumerate(zip(xml_paths, arrangement_names)):
             progress(f"Converting {arr_name} XML to SNG...", 10 + i * 15)
@@ -220,12 +223,15 @@ def build_cdlc(
             sng_dir.mkdir(parents=True, exist_ok=True)
             sng_path = sng_dir / f"{dlc_key}_{arr_lower}.sng"
 
+            log.info(f"[Build] Converting {xml_path} to SNG via RsCli")
             result = subprocess.run(
                 [str(RSCLI), "xml2sng", xml_path, str(sng_path)],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
+                log.error(f"[Build] RsCli failed: {result.stderr}")
                 raise RuntimeError(f"SNG conversion failed for {arr_name}: {result.stderr}")
+            log.info(f"[Build] SNG written to {sng_path}")
 
             # Copy XML arrangement
             arr_dir = build_dir / "songs" / "arr"
@@ -261,11 +267,14 @@ def build_cdlc(
 
         # ── HSAN ──────────────────────────────────────────────────────────
         progress("Generating manifests...", 60)
+        log.info(f"[Build] Generating HSAN from {len(manifests)} manifests")
         hsan = _generate_hsan(manifests)
+        log.info(f"[Build] HSAN has {len(hsan.get('Entries', {}))} entries")
         manifest_dir = build_dir / "manifests" / f"songs_dlc_{dlc_key}"
-        (manifest_dir / f"songs_dlc_{dlc_key}.hsan").write_text(
-            json.dumps(hsan, indent=2)
-        )
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        hsan_path = manifest_dir / f"songs_dlc_{dlc_key}.hsan"
+        hsan_path.write_text(json.dumps(hsan, indent=2))
+        log.info(f"[Build] Wrote HSAN to {hsan_path}")
 
         # ── Audio ─────────────────────────────────────────────────────────
         progress("Processing audio...", 65)
@@ -343,6 +352,7 @@ def build_cdlc(
 
         # ── Showlights ────────────────────────────────────────────────────
         arr_dir = build_dir / "songs" / "arr"
+        arr_dir.mkdir(parents=True, exist_ok=True)
         (arr_dir / f"{dlc_key}_showlights.xml").write_text(
             _generate_showlights(song_length)
         )
@@ -370,7 +380,14 @@ def build_cdlc(
             safe_artist = re.sub(r'[<>:"/\\|?*]', '_', artist)
             output_path = f"{safe_title}_{safe_artist}_p.psarc"
 
+        log.info(f"[Build] Packing {build_dir} to {output_path}")
         pack_psarc(str(build_dir), output_path)
+
+        if Path(output_path).exists():
+            log.info(f"[Build] PSARC packed successfully: {output_path} ({Path(output_path).stat().st_size} bytes)")
+        else:
+            log.error(f"[Build] Output file does not exist after packing!")
+
         progress(f"Created: {output_path}", 100)
         return output_path
 

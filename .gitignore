@@ -35,3 +35,4 @@ plugins/tabview
 test_transcribe_piano.py
 test_transcribe_flow.py
 plugins/tabview
+static/editor_*
